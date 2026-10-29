@@ -1,0 +1,17 @@
+# Ignore Virtual Environment
+.venv/
+venv/
+
+# Ignore Large AI Models
+vosk-model/
+vosk-model-small/
+
+# Ignore Secret Keys and Logs
+*.env
+session_log.txt
+sentinel_log.txt
+active.lock
+
+# Ignore Python Cache
+__pycache__/
+*.pyc
