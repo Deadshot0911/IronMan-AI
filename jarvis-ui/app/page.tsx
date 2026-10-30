@@ -1,6 +1,6 @@
 "use client";
 import { useState, useRef, useMemo, useEffect } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, CSSProperties } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Mic, MessageSquare, History, Cpu, Minimize2, Maximize2, SendHorizontal } from "lucide-react";
 import { Canvas, useFrame } from "@react-three/fiber";
@@ -9,6 +9,8 @@ import * as THREE from "three";
 
 const CYAN = "#22e5ff";
 const ORANGE = "#ff9a3c";
+const VIOLET = "#8b5cff";
+const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
 // --- DYNAMIC LINES COMPONENT ---
 function DynamicLines() {
@@ -59,10 +61,10 @@ function DynamicLines() {
         <Line
           key={line.id}
           points={[line.start, line.end]}
-          color="#00ffff"
+          color="#7df3ff"
           lineWidth={1}
           transparent
-          opacity={line.opacity * 0.3}
+          opacity={line.opacity * 0.35}
         />
       ))}
     </group>
@@ -86,9 +88,9 @@ function Hologram({
     const pos = new Float32Array(count * 3);
     const cols = new Float32Array(count * 3);
 
-    const colorCyan = new THREE.Color("#00ffff");
+    const colorCyan = new THREE.Color("#22e5ff");
     const colorWhite = new THREE.Color("#ffffff");
-    const colorBlue = new THREE.Color("#0066ff");
+    const colorViolet = new THREE.Color(VIOLET);
 
     for (let i = 0; i < count; i++) {
       const r = 1.1 + Math.random() * 0.5;
@@ -101,7 +103,7 @@ function Hologram({
       pos[i * 3 + 2] = (r + noise) * Math.cos(phi);
 
       const rand = Math.random();
-      const c = rand < 0.6 ? colorCyan : rand < 0.9 ? colorWhite : colorBlue;
+      const c = rand < 0.55 ? colorCyan : rand < 0.82 ? colorWhite : colorViolet;
       cols[i * 3] = c.r;
       cols[i * 3 + 1] = c.g;
       cols[i * 3 + 2] = c.b;
@@ -166,7 +168,6 @@ function Hologram({
       if (hoveredButton === "voice") targetDir.set(1, 0, 0);
       if (hoveredButton === "memory") targetDir.set(0, -1, 0);
       if (hoveredButton === "engine") targetDir.set(-1, 0, 0);
-      
       const inverseRotation = new THREE.Quaternion().copy(groupRef.current.quaternion).invert();
       targetDir.applyQuaternion(inverseRotation);
       u.uBulgeDir.value.lerp(targetDir, 0.1);
@@ -196,7 +197,7 @@ function Hologram({
   );
 }
 
-// --- ICON BUTTON ---
+// --- ICON BUTTON (glass puck set into the slab) ---
 function IconButton({
   icon,
   label,
@@ -204,6 +205,8 @@ function IconButton({
   active,
   hovered,
   side,
+  badge,
+  badgeOn,
 }: {
   icon: ReactNode;
   label: string;
@@ -211,78 +214,97 @@ function IconButton({
   active: boolean;
   hovered: boolean;
   side: "top" | "bottom" | "left" | "right";
+  badge?: string;
+  badgeOn?: boolean;
 }) {
-  const labelPos: React.CSSProperties =
+  const labelPos: CSSProperties =
     side === "top"
       ? { bottom: "100%", left: "50%", transform: "translateX(-50%)", marginBottom: 14 }
       : side === "bottom"
-      ? { top: "100%", left: "50%", transform: "translateX(-50%)", marginTop: 14 }
+      ? { top: "100%", left: "50%", transform: "translateX(-50%)", marginTop: 16 }
       : side === "left"
       ? { right: "100%", top: "50%", transform: "translateY(-50%)", marginRight: 14 }
       : { left: "100%", top: "50%", transform: "translateY(-50%)", marginLeft: 14 };
 
-  const style: React.CSSProperties = {
-    position: "relative",
-    width: 64,
-    height: 64,
-    padding: 0,
-    borderRadius: "50%",
-    display: "grid",
-    placeItems: "center",
-    cursor: "pointer",
-    outline: "none",
-    backdropFilter: "blur(14px)",
-    WebkitBackdropFilter: "blur(14px)",
-    transition: "all 0.3s ease",
-    transform: hovered ? "scale(1.1)" : "scale(1)",
-    ...(active
-      ? {
-          background: "rgba(34,229,255,0.16)",
-          border: "1px solid rgba(34,229,255,0.9)",
-          color: "#8ef5ff",
-          boxShadow: "0 0 22px rgba(34,229,255,0.45), inset 0 0 14px rgba(34,229,255,0.2)",
-        }
-      : hovered
-      ? {
-          background: "rgba(34,229,255,0.1)",
-          border: "1px solid rgba(34,229,255,0.6)",
-          color: "#c4faff",
-          boxShadow: "0 0 18px rgba(34,229,255,0.3)",
-        }
-      : {
-          background: "rgba(255,255,255,0.05)",
-          border: "1px solid rgba(255,255,255,0.14)",
-          color: "#8fb8c2",
-          boxShadow: "0 0 0 rgba(0,0,0,0)",
-        }),
-  };
+  const inset = "inset 0 2px 5px rgba(255,255,255,0.18), inset 0 -8px 14px rgba(0,0,0,0.7)";
+  const look: CSSProperties = active
+    ? {
+        background: "radial-gradient(circle at 30% 22%, rgba(190,250,255,0.5), rgba(34,229,255,0.16) 52%, rgba(0,18,28,0.75) 100%)",
+        color: "#e9fdff",
+        boxShadow: `${inset}, 0 0 0 1px ${CYAN}, 0 0 28px rgba(34,229,255,0.55), 0 10px 22px rgba(0,0,0,0.8)`,
+      }
+    : hovered
+    ? {
+        background: "radial-gradient(circle at 30% 22%, rgba(210,196,255,0.4), rgba(139,92,255,0.14) 52%, rgba(14,6,30,0.75) 100%)",
+        color: "#e3dbff",
+        boxShadow: `${inset}, 0 0 0 1px rgba(139,92,255,0.85), 0 0 24px rgba(139,92,255,0.5), 0 10px 22px rgba(0,0,0,0.8)`,
+      }
+    : {
+        background: "radial-gradient(circle at 30% 22%, rgba(255,255,255,0.2), rgba(255,255,255,0.04) 42%, rgba(0,0,0,0.55) 100%)",
+        color: "#bfefff",
+        boxShadow: `${inset}, 0 0 0 1px rgba(255,255,255,0.1), 0 10px 22px rgba(0,0,0,0.8)`,
+      };
 
   return (
     <div style={{ position: "relative" }}>
       {active && <span className="jv-ring" />}
-      <button onClick={onClick} style={style} aria-label={label}>
+      <button
+        onClick={onClick}
+        aria-label={label}
+        style={{
+          position: "relative",
+          width: 64,
+          height: 64,
+          padding: 0,
+          border: "none",
+          borderRadius: "50%",
+          display: "grid",
+          placeItems: "center",
+          cursor: "pointer",
+          outline: "none",
+          transition: "all 0.3s ease",
+          transform: hovered ? "scale(1.1)" : "scale(1)",
+          ...look,
+        }}
+      >
+        <span style={{ position: "relative", display: "grid", placeItems: "center" }}>{icon}</span>
+      </button>
+
+      {badge && (
         <span
           style={{
             position: "absolute",
-            inset: 0,
-            borderRadius: "50%",
-            background: "linear-gradient(to bottom, rgba(255,255,255,0.12), transparent)",
+            left: "50%",
+            bottom: -8,
+            transform: "translateX(-50%)",
+            padding: "1px 7px",
+            fontFamily: MONO,
+            fontSize: 8,
+            letterSpacing: "0.15em",
+            whiteSpace: "nowrap",
+            borderRadius: 8,
+            background: "#04070a",
+            border: `1px solid ${badgeOn ? CYAN : "rgba(255,255,255,0.18)"}`,
+            color: badgeOn ? CYAN : "#7d97a0",
+            boxShadow: badgeOn ? "0 0 10px rgba(34,229,255,0.35)" : "none",
             pointerEvents: "none",
           }}
-        />
-        <span style={{ position: "relative", display: "grid", placeItems: "center" }}>{icon}</span>
-      </button>
+        >
+          {badge}
+        </span>
+      )}
+
       <div
         style={{
           position: "absolute",
           ...labelPos,
           padding: "5px 12px",
-          background: "rgba(0,0,0,0.9)",
-          color: "#8ef5ff",
+          background: "rgba(0,0,0,0.92)",
+          color: "#bfefff",
           fontSize: 10,
           letterSpacing: "0.18em",
           textTransform: "uppercase",
-          fontFamily: "ui-monospace, monospace",
+          fontFamily: MONO,
           whiteSpace: "nowrap",
           borderRadius: 6,
           border: "1px solid rgba(34,229,255,0.3)",
@@ -304,6 +326,10 @@ export default function JarvisUI() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [isTextMode, setIsTextMode] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
+  const [isSilent, setIsSilent] = useState(false);
+  const [memoryOn, setMemoryOn] = useState(false);
+  const [engine, setEngine] = useState({ mode: "Auto", name: "Auto", model: "" });
+  const [showEngine, setShowEngine] = useState(false);
   const [miniHover, setMiniHover] = useState(false);
   const [hoveredButton, setHoveredButton] = useState<string | null>(null);
   const [vp, setVp] = useState({ w: 1280, h: 800 });
@@ -320,51 +346,93 @@ export default function JarvisUI() {
     return () => window.removeEventListener("resize", update);
   }, []);
 
+  // state pushed from Python
   useEffect(() => {
-    const handleStateChange = (event: Event) => {
-      const state = (event as CustomEvent).detail;
-      if (state === "listening") {
+    const h = (e: Event) => {
+      const d = (e as CustomEvent).detail;
+      const s = typeof d === "string" ? { state: d } : d;
+      if (s.state === "listening") {
         setIsListening(true);
         setIsProcessing(false);
-      } else if (state === "processing" || state === "speaking") {
+      } else if (s.state === "processing" || s.state === "speaking") {
         setIsListening(false);
         setIsProcessing(true);
-      } else if (state === "standby") {
+      } else if (s.state === "standby") {
         setIsListening(false);
         setIsProcessing(false);
-      } else if (state === "minimized") {
-        setIsMinimized(true);
-      } else if (state === "maximized") {
-        setIsMinimized(false);
       }
+      if (typeof s.mini === "boolean") {
+        setIsMinimized(s.mini);
+        if (s.mini) setHoveredButton(null);
+      }
+      if (typeof s.silent === "boolean") setIsSilent(s.silent);
+      if (typeof s.memory === "boolean") setMemoryOn(s.memory);
+      if (s.engine) setEngine(s.engine);
     };
-    window.addEventListener("jarvisState", handleStateChange);
-    return () => window.removeEventListener("jarvisState", handleStateChange);
+    window.addEventListener("jarvisState", h);
+    return () => window.removeEventListener("jarvisState", h);
   }, []);
+
+  useEffect(() => {
+    if (isMinimized) setShowEngine(false);
+  }, [isMinimized]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // ---- messages to Python ----
+  const send = (t: string) => window.dispatchEvent(new CustomEvent("jarvisCommand", { detail: t }));
+  const act = (o: object) => window.dispatchEvent(new CustomEvent("jarvisAction", { detail: o }));
+  const linked = () => !!(window as any).__jarvisLinked;
+  const wake = () => {
+    send("jarvis wake up");
+    if (!linked()) setIsMinimized(false);
+  };
+  const minimize = () => {
+    send("jarvis minimise and listen");
+    if (!linked()) {
+      setIsMinimized(true);
+      setHoveredButton(null);
+    }
+  };
+  const toggleMemory = () => {
+    const v = !memoryOn;
+    setMemoryOn(v);
+    act({ action: "set_memory", on: v });
+  };
+  const pickEngine = (m: string) => {
+    act({ action: "set_engine", engine: m });
+    setEngine((e) => ({ ...e, mode: m }));
+    setShowEngine(false);
+  };
   const sendMessage = () => {
     const text = input.trim();
     if (!text) return;
     setMessages((m) => [...m, { from: "you", text }]);
     setInput("");
-    window.dispatchEvent(new CustomEvent("jarvisCommand", { detail: text }));
+    send(text);
   };
 
   const hologramState = isProcessing ? "speaking" : isListening ? "listening" : "standby";
   const accent = isProcessing ? ORANGE : CYAN;
   const statusLabel = isProcessing ? "PROCESSING" : isListening ? "LISTENING" : "STANDBY";
+  const engineShown = engine.name && engine.name !== "—" ? engine.name : engine.mode;
+  const modelShort = (engine.model || "").replace("openai/", "");
 
-  const S = Math.max(150, Math.min(700, vp.w - 24, vp.h - 24));
-  const MINI = 150;
-  const MARGIN = 28;
-  const miniScale = MINI / S;
-  const miniX = vp.w / 2 - MARGIN - MINI / 2;
-  const miniY = vp.h / 2 - MARGIN - MINI / 2;
+  // sizing
+  const compact = vp.w < 320; // real window is the small orb window
+  const S = compact ? vp.w - 30 : Math.max(320, Math.min(700, vp.w - 24, vp.h - 24));
+  const MINI = 170;
+  const miniScale = compact ? 1 : MINI / S;
+  const prevCompact = useRef(compact);
+  const snap = prevCompact.current !== compact;
+  useEffect(() => {
+    prevCompact.current = compact;
+  });
   const radius = S * 0.37;
+  const ease = [0.65, 0, 0.35, 1] as const;
+  const dur = snap ? 0 : 0.8;
 
   const buttons = [
     {
@@ -385,77 +453,167 @@ export default function JarvisUI() {
       angle: 0,
       side: "right" as const,
     },
-    { id: "memory", icon: <History size={24} />, label: "Memory", active: false, angle: 90, side: "bottom" as const },
-    { id: "engine", icon: <Cpu size={24} />, label: "Engine", active: false, angle: 180, side: "left" as const },
+    {
+      id: "memory",
+      icon: <History size={24} />,
+      label: `Memory ${memoryOn ? "On" : "Off"}`,
+      onClick: toggleMemory,
+      active: memoryOn,
+      angle: 90,
+      side: "bottom" as const,
+      badge: memoryOn ? "ON" : "OFF",
+      badgeOn: memoryOn,
+    },
+    {
+      id: "engine",
+      icon: <Cpu size={24} />,
+      label: "AI Engine",
+      onClick: () => setShowEngine((v) => !v),
+      active: showEngine,
+      angle: 180,
+      side: "left" as const,
+      badge: engineShown.toUpperCase(),
+      badgeOn: true,
+    },
   ];
 
-  const glassBtn: React.CSSProperties = {
+  const glassBtn: CSSProperties = {
     position: "fixed",
-    top: 24,
-    right: 24,
+    top: 30,
+    right: 30,
     zIndex: 100,
-    width: 52,
-    height: 52,
+    width: 48,
+    height: 48,
     borderRadius: "50%",
     display: "grid",
     placeItems: "center",
     cursor: "pointer",
-    color: "#8ef5ff",
-    background: "rgba(255,255,255,0.06)",
-    border: "1px solid rgba(34,229,255,0.35)",
-    backdropFilter: "blur(14px)",
-    WebkitBackdropFilter: "blur(14px)",
-    boxShadow: "0 0 18px rgba(34,229,255,0.2)",
+    color: "#bfefff",
+    border: "none",
+    background: "radial-gradient(circle at 30% 22%, rgba(255,255,255,0.2), rgba(255,255,255,0.04) 45%, rgba(0,0,0,0.55) 100%)",
+    boxShadow: "inset 0 2px 5px rgba(255,255,255,0.18), inset 0 -6px 12px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.12), 0 8px 18px rgba(0,0,0,0.8)",
     padding: 0,
   };
+
+  const slabW = isMinimized ? 200 : Math.max(0, vp.w - 24);
+  const slabH = isMinimized ? 200 : Math.max(0, vp.h - 24);
 
   return (
     <div
       style={{
         position: "fixed",
         inset: 0,
-        background: "transparent",
+        background: "#000",
         overflow: "hidden",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        pointerEvents: isMinimized ? "none" : "auto",
       }}
     >
       <style>{`
+        html, body { background: #000 !important; margin: 0; }
         @keyframes jv-eq { 0%,100% { transform: scaleY(0.25); } 50% { transform: scaleY(1); } }
         @keyframes jv-pulse { 0% { transform: scale(1); opacity: .7; } 100% { transform: scale(1.55); opacity: 0; } }
         @keyframes jv-blink { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+        @keyframes jv-sheen { 0% { transform: translateX(-140%) skewX(-20deg); } 100% { transform: translateX(340%) skewX(-20deg); } }
         .jv-ring { position:absolute; inset:0; border-radius:50%; border:1px solid ${CYAN}; animation: jv-pulse 2s ease-out infinite; pointer-events:none; }
         .jv-input::placeholder { color: rgba(142,245,255,0.4); }
       `}</style>
 
-      {[CYAN, ORANGE].map((c) => (
-        <div
-          key={c}
+      {/* ===== BLACK STAINED-GLASS SLAB ===== */}
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          pointerEvents: "none",
+          zIndex: 0,
+        }}
+      >
+        <motion.div
+          initial={false}
+          animate={{ width: slabW, height: slabH, borderRadius: isMinimized ? 44 : 40 }}
+          transition={{ duration: dur, ease }}
           style={{
-            position: "absolute",
-            width: 760,
-            height: 760,
-            borderRadius: "50%",
-            pointerEvents: "none",
-            background: `radial-gradient(circle, ${c}22 0%, transparent 65%)`,
-            opacity: !isMinimized && accent === c ? 1 : 0,
-            transition: "opacity 1s ease",
+            position: "relative",
+            overflow: "hidden",
+            background: `
+              linear-gradient(135deg, rgba(34,229,255,0.07) 0%, transparent 30%),
+              linear-gradient(225deg, rgba(139,92,255,0.10) 0%, transparent 34%),
+              radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,0.07) 0%, transparent 55%),
+              #05070b`,
+            boxShadow:
+              "inset 0 0 0 1px rgba(255,255,255,0.09), inset 0 1px 0 rgba(255,255,255,0.22), inset 0 -50px 90px rgba(0,0,0,0.7), inset 0 0 70px rgba(34,229,255,0.05), 0 30px 80px rgba(0,0,0,0.9)",
           }}
-        />
-      ))}
+        >
+          {/* leaded stained-glass facets */}
+          <svg
+            viewBox="0 0 100 100"
+            preserveAspectRatio="none"
+            style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+          >
+            <polygon points="0,0 38,0 0,34" fill="rgba(34,229,255,0.05)" />
+            <polygon points="100,0 62,0 100,40" fill="rgba(139,92,255,0.07)" />
+            <polygon points="0,100 0,66 30,100" fill="rgba(139,92,255,0.06)" />
+            <polygon points="100,100 70,100 100,62" fill="rgba(34,229,255,0.05)" />
+            <polygon points="38,0 62,0 50,22" fill="rgba(255,255,255,0.03)" />
+            <path
+              d="M0 34 L38 0 M100 40 L62 0 M0 66 L30 100 M100 62 L70 100 M38 0 L50 22 L62 0 M50 22 L50 38"
+              stroke="rgba(160,230,255,0.13)"
+              strokeWidth="1"
+              fill="none"
+              vectorEffect="non-scaling-stroke"
+            />
+          </svg>
 
+          {/* moving specular sheen */}
+          <div
+            style={{
+              position: "absolute",
+              top: 0,
+              bottom: 0,
+              left: 0,
+              width: "22%",
+              background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.06), transparent)",
+              animation: "jv-sheen 9s linear infinite",
+            }}
+          />
+
+          {/* ambient glow (cross-fades cyan/orange with state) */}
+          {[CYAN, ORANGE].map((c) => (
+            <div
+              key={c}
+              style={{
+                position: "absolute",
+                left: "50%",
+                top: "50%",
+                width: 760,
+                height: 760,
+                marginLeft: -380,
+                marginTop: -380,
+                borderRadius: "50%",
+                background: `radial-gradient(circle, ${c}24 0%, transparent 62%)`,
+                opacity: !isMinimized && accent === c ? 1 : 0,
+                transition: "opacity 1s ease",
+              }}
+            />
+          ))}
+        </motion.div>
+      </div>
+
+      {/* THE MODEL: one canvas, shrinks in place (Python glides the window to the corner) */}
       <motion.div
         initial={false}
         animate={
           isMinimized
-            ? { scale: miniScale, x: miniX, y: miniY }
-            : { scale: 1, x: 0, y: 0 }
+            ? { scale: miniScale, x: 0, y: 0, opacity: isSilent ? 0.4 : 1 }
+            : { scale: 1, x: 0, y: 0, opacity: 1 }
         }
         whileHover={isMinimized ? { scale: miniScale * 1.12 } : undefined}
-        transition={{ duration: 0.8, ease: [0.65, 0, 0.35, 1] }}
-        onClick={() => isMinimized && setIsMinimized(false)}
+        transition={{ duration: dur, ease }}
+        onClick={() => isMinimized && wake()}
         onHoverStart={() => setMiniHover(true)}
         onHoverEnd={() => setMiniHover(false)}
         style={{
@@ -468,17 +626,12 @@ export default function JarvisUI() {
         }}
       >
         <div style={{ position: "absolute", inset: 0 }}>
-          <Canvas 
-            camera={{ position: [0, 0, 6], fov: 50 }} 
-            dpr={[1, 2]} 
-            gl={{ alpha: true, antialias: true, preserveDrawingBuffer: true }} 
-            onCreated={({ gl }) => gl.setClearColor(0x000000, 0)}               
-            style={{ width: "100%", height: "100%", background: "transparent" }}
-          >
+          <Canvas camera={{ position: [0, 0, 6], fov: 50 }} dpr={[1, 2]} style={{ width: "100%", height: "100%" }}>
             <Hologram state={hologramState} isMinimized={isMinimized} hoveredButton={isMinimized ? null : hoveredButton} />
           </Canvas>
         </div>
 
+        {/* centre status text, above the particles */}
         <AnimatePresence>
           {!isMinimized && (
             <motion.div
@@ -501,9 +654,9 @@ export default function JarvisUI() {
               <div
                 style={{
                   position: "absolute",
-                  width: 340,
-                  height: 150,
-                  background: "radial-gradient(ellipse, rgba(0,0,0,0.75) 0%, rgba(0,0,0,0.35) 50%, transparent 75%)",
+                  width: 360,
+                  height: 160,
+                  background: "radial-gradient(ellipse, rgba(0,0,0,0.8) 0%, rgba(0,0,0,0.4) 50%, transparent 75%)",
                 }}
               />
               <div style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
@@ -514,7 +667,7 @@ export default function JarvisUI() {
                     fontWeight: 700,
                     letterSpacing: "0.4em",
                     paddingLeft: "0.4em",
-                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                    fontFamily: MONO,
                     color: accent,
                     textShadow: `0 0 8px ${accent}, 0 0 22px ${accent}, 0 0 48px ${accent}88, 0 2px 4px #000`,
                     transition: "color 0.5s, text-shadow 0.5s",
@@ -551,10 +704,11 @@ export default function JarvisUI() {
                     alignItems: "center",
                     gap: 8,
                     fontSize: 10,
-                    letterSpacing: "0.3em",
-                    fontFamily: "ui-monospace, monospace",
-                    color: "rgba(200,250,255,0.7)",
+                    letterSpacing: "0.26em",
+                    fontFamily: MONO,
+                    color: "rgba(210,250,255,0.75)",
                     textShadow: "0 0 6px #000",
+                    whiteSpace: "nowrap",
                   }}
                 >
                   <span
@@ -567,13 +721,14 @@ export default function JarvisUI() {
                       animation: "jv-blink 1.6s ease-in-out infinite",
                     }}
                   />
-                  {isTextMode ? "TEXT LINK ONLINE" : "VOICE LINK ONLINE"}
+                  {(isTextMode ? "TEXT" : "VOICE") + " LINK · " + engineShown.toUpperCase() + (memoryOn ? " · MEMORY ON" : "")}
                 </div>
               </div>
             </motion.div>
           )}
         </AnimatePresence>
 
+        {/* 4 orbiting buttons */}
         <AnimatePresence>
           {!isMinimized &&
             buttons.map((btn, i) => {
@@ -602,13 +757,74 @@ export default function JarvisUI() {
                     active={btn.active}
                     hovered={hoveredButton === btn.id}
                     side={btn.side}
+                    badge={(btn as any).badge}
+                    badgeOn={(btn as any).badgeOn}
                   />
                 </motion.div>
               );
             })}
         </AnimatePresence>
+
+        {/* ENGINE PICKER */}
+        <AnimatePresence>
+          {showEngine && !isMinimized && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              style={{
+                position: "absolute",
+                left: S / 2 - radius - 90,
+                top: S / 2 + 56,
+                width: 180,
+                zIndex: 40,
+                padding: 12,
+                borderRadius: 14,
+                background: "rgba(2,5,8,0.92)",
+                backdropFilter: "blur(16px)",
+                WebkitBackdropFilter: "blur(16px)",
+                border: "1px solid rgba(34,229,255,0.3)",
+                boxShadow: "0 0 24px rgba(34,229,255,0.15), inset 0 1px 0 rgba(255,255,255,0.1)",
+                fontFamily: MONO,
+              }}
+            >
+              <div style={{ fontSize: 9, letterSpacing: "0.2em", color: "#7d97a0", marginBottom: 4 }}>IN USE NOW</div>
+              <div style={{ fontSize: 12, color: CYAN, marginBottom: 10, textShadow: `0 0 8px ${CYAN}` }}>
+                {engineShown.toUpperCase()}
+                {modelShort ? ` · ${modelShort}` : ""}
+              </div>
+              {["Auto", "Gemini", "Groq", "Ollama"].map((m) => (
+                <button
+                  key={m}
+                  onClick={() => pickEngine(m)}
+                  style={{
+                    width: "100%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    padding: "7px 10px",
+                    marginBottom: 4,
+                    borderRadius: 8,
+                    cursor: "pointer",
+                    fontFamily: MONO,
+                    fontSize: 11,
+                    letterSpacing: "0.12em",
+                    textTransform: "uppercase",
+                    color: engine.mode === m ? "#e9fdff" : "#9fc3cc",
+                    background: engine.mode === m ? "rgba(34,229,255,0.16)" : "rgba(255,255,255,0.04)",
+                    border: `1px solid ${engine.mode === m ? CYAN : "rgba(255,255,255,0.08)"}`,
+                  }}
+                >
+                  {m}
+                  {engine.mode === m && <span style={{ color: CYAN }}>●</span>}
+                </button>
+              ))}
+            </motion.div>
+          )}
+        </AnimatePresence>
       </motion.div>
 
+      {/* MINIMIZE button: top-right (only when maximized) */}
       <AnimatePresence>
         {!isMinimized && (
           <motion.button
@@ -617,10 +833,7 @@ export default function JarvisUI() {
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.6 }}
             whileHover={{ scale: 1.1 }}
-            onClick={() => {
-              setIsMinimized(true);
-              setHoveredButton(null);
-            }}
+            onClick={minimize}
             style={glassBtn}
             aria-label="Minimize"
           >
@@ -629,21 +842,24 @@ export default function JarvisUI() {
         )}
       </AnimatePresence>
 
+      {/* orb ring + maximize hint (only when minimized) */}
       <div
         style={{
           position: "fixed",
-          right: MARGIN,
-          bottom: MARGIN,
+          left: "50%",
+          top: "50%",
+          marginLeft: -MINI / 2,
+          marginTop: -MINI / 2,
           width: MINI,
           height: MINI,
           borderRadius: "50%",
-          border: "1px solid rgba(34,229,255,0.25)",
+          border: "1px solid rgba(34,229,255,0.28)",
           boxShadow: "0 0 30px rgba(34,229,255,0.2), inset 0 0 30px rgba(34,229,255,0.08)",
           display: "grid",
           placeItems: "center",
           pointerEvents: "none",
           zIndex: 40,
-          opacity: isMinimized ? 1 : 0,
+          opacity: isMinimized ? (isSilent ? 0.4 : 1) : 0,
           transition: "opacity 0.5s ease",
           transitionDelay: isMinimized ? "0.5s" : "0s",
         }}
@@ -659,12 +875,13 @@ export default function JarvisUI() {
         />
       </div>
 
+      {/* TEXT MODE PANEL */}
       <AnimatePresence>
         {isTextMode && !isMinimized && (
           <div
             style={{
               position: "fixed",
-              bottom: 32,
+              bottom: 36,
               left: 0,
               right: 0,
               display: "flex",
@@ -678,19 +895,19 @@ export default function JarvisUI() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 30 }}
               style={{
-                width: Math.min(520, vp.w - 32),
+                width: Math.min(520, vp.w - 56),
                 height: 230,
                 display: "flex",
                 flexDirection: "column",
                 padding: 20,
                 borderRadius: 18,
                 pointerEvents: "auto",
-                background: "rgba(0,0,0,0.65)",
+                background: "rgba(2,5,8,0.82)",
                 backdropFilter: "blur(20px)",
                 WebkitBackdropFilter: "blur(20px)",
                 border: "1px solid rgba(34,229,255,0.3)",
-                boxShadow: "0 0 30px rgba(34,229,255,0.12)",
-                fontFamily: "ui-monospace, monospace",
+                boxShadow: "0 0 30px rgba(34,229,255,0.12), inset 0 1px 0 rgba(255,255,255,0.1)",
+                fontFamily: MONO,
               }}
             >
               <div style={{ flex: 1, overflowY: "auto", fontSize: 13, color: "rgba(200,250,255,0.85)" }}>
