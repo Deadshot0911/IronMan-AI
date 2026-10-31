@@ -10,7 +10,10 @@ import * as THREE from "three";
 const CYAN = "#22e5ff";
 const ORANGE = "#ff9a3c";
 const VIOLET = "#8b5cff";
+const RED = "#ff5470";
 const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
+
+type Msg = { id: number; from: "jarvis" | "you"; text: string };
 
 // --- DYNAMIC LINES COMPONENT ---
 function DynamicLines() {
@@ -320,10 +323,30 @@ function IconButton({
   );
 }
 
+// --- HUD corner bracket ---
+function Bracket({ pos, color }: { pos: "tl" | "tr" | "bl" | "br"; color: string }) {
+  const s: CSSProperties = {
+    position: "absolute",
+    width: 26,
+    height: 26,
+    borderColor: color,
+    borderStyle: "solid",
+    borderWidth: 0,
+    opacity: 0.55,
+    transition: "border-color 0.5s",
+  };
+  if (pos === "tl") Object.assign(s, { top: 22, left: 22, borderTopWidth: 2, borderLeftWidth: 2, borderTopLeftRadius: 10 });
+  if (pos === "tr") Object.assign(s, { top: 22, right: 22, borderTopWidth: 2, borderRightWidth: 2, borderTopRightRadius: 10 });
+  if (pos === "bl") Object.assign(s, { bottom: 22, left: 22, borderBottomWidth: 2, borderLeftWidth: 2, borderBottomLeftRadius: 10 });
+  if (pos === "br") Object.assign(s, { bottom: 22, right: 22, borderBottomWidth: 2, borderRightWidth: 2, borderBottomRightRadius: 10 });
+  return <div style={s} />;
+}
+
 // --- MAIN UI COMPONENT ---
 export default function JarvisUI() {
   const [isListening, setIsListening] = useState(true);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
   const [isTextMode, setIsTextMode] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
   const [isSilent, setIsSilent] = useState(false);
@@ -333,9 +356,7 @@ export default function JarvisUI() {
   const [miniHover, setMiniHover] = useState(false);
   const [hoveredButton, setHoveredButton] = useState<string | null>(null);
   const [vp, setVp] = useState({ w: 1280, h: 800 });
-  const [messages, setMessages] = useState<{ from: "jarvis" | "you"; text: string }[]>([
-    { from: "jarvis", text: "Good evening, Sir. How may I assist you?" },
-  ]);
+  const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -366,11 +387,32 @@ export default function JarvisUI() {
         if (s.mini) setHoveredButton(null);
       }
       if (typeof s.silent === "boolean") setIsSilent(s.silent);
+      if (typeof s.online === "boolean") setIsOnline(s.online);
       if (typeof s.memory === "boolean") setMemoryOn(s.memory);
+      if (typeof s.text_mode === "boolean") setIsTextMode(s.text_mode);
       if (s.engine) setEngine(s.engine);
     };
     window.addEventListener("jarvisState", h);
     return () => window.removeEventListener("jarvisState", h);
+  }, []);
+
+  // chat messages pushed from Python (upsert by id, so streaming replies grow in place)
+  useEffect(() => {
+    const h = (e: Event) => {
+      const m = (e as CustomEvent).detail as Msg;
+      setMessages((prev) => {
+        const i = prev.findIndex((x) => x.id === m.id);
+        const item: Msg = { id: m.id, from: m.from, text: m.text };
+        if (i >= 0) {
+          const next = [...prev];
+          next[i] = item;
+          return next;
+        }
+        return [...prev, item].slice(-80);
+      });
+    };
+    window.addEventListener("jarvisChat", h);
+    return () => window.removeEventListener("jarvisChat", h);
   }, []);
 
   useEffect(() => {
@@ -379,22 +421,25 @@ export default function JarvisUI() {
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, isProcessing]);
 
-  // ---- messages to Python ----
-  const send = (t: string) => window.dispatchEvent(new CustomEvent("jarvisCommand", { detail: t }));
+  // ---- messages to Python (falls back to local behaviour in a plain browser) ----
   const act = (o: object) => window.dispatchEvent(new CustomEvent("jarvisAction", { detail: o }));
   const linked = () => !!(window as any).__jarvisLinked;
   const wake = () => {
-    send("jarvis wake up");
+    act({ action: "ui", do: "maximize" });
     if (!linked()) setIsMinimized(false);
   };
   const minimize = () => {
-    send("jarvis minimise and listen");
+    act({ action: "ui", do: "minimize" });
     if (!linked()) {
       setIsMinimized(true);
       setHoveredButton(null);
     }
+  };
+  const setMode = (text: boolean) => {
+    setIsTextMode(text);
+    act({ action: "set_mode", text });
   };
   const toggleMemory = () => {
     const v = !memoryOn;
@@ -403,25 +448,26 @@ export default function JarvisUI() {
   };
   const pickEngine = (m: string) => {
     act({ action: "set_engine", engine: m });
-    setEngine((e) => ({ ...e, mode: m }));
     setShowEngine(false);
   };
   const sendMessage = () => {
     const text = input.trim();
     if (!text) return;
-    setMessages((m) => [...m, { from: "you", text }]);
     setInput("");
-    send(text);
+    window.dispatchEvent(new CustomEvent("jarvisCommand", { detail: text }));
+    if (!linked()) setMessages((m) => [...m, { id: -Date.now(), from: "you", text }]);
   };
 
-  const hologramState = isProcessing ? "speaking" : isListening ? "listening" : "standby";
-  const accent = isProcessing ? ORANGE : CYAN;
-  const statusLabel = isProcessing ? "PROCESSING" : isListening ? "LISTENING" : "STANDBY";
+  const hologramState = !isOnline ? "standby" : isProcessing ? "speaking" : isListening ? "listening" : "standby";
+  const accent = !isOnline ? RED : isProcessing ? ORANGE : CYAN;
+  const statusLabel = !isOnline ? "OFFLINE" : isProcessing ? "PROCESSING" : isListening ? "LISTENING" : "STANDBY";
   const engineShown = engine.name && engine.name !== "—" ? engine.name : engine.mode;
   const modelShort = (engine.model || "").replace("openai/", "");
+  const dim = !isOnline || isSilent;
+  const lastIsYou = messages.length > 0 && messages[messages.length - 1].from === "you";
 
   // sizing
-  const compact = vp.w < 320; // real window is the small orb window
+  const compact = vp.w < 320; // the real window is the small orb window
   const S = compact ? vp.w - 30 : Math.max(320, Math.min(700, vp.w - 24, vp.h - 24));
   const MINI = 170;
   const miniScale = compact ? 1 : MINI / S;
@@ -439,7 +485,7 @@ export default function JarvisUI() {
       id: "text",
       icon: <MessageSquare size={24} />,
       label: "Text Mode",
-      onClick: () => setIsTextMode((v) => !v),
+      onClick: () => setMode(!isTextMode),
       active: isTextMode,
       angle: -90,
       side: "top" as const,
@@ -448,7 +494,7 @@ export default function JarvisUI() {
       id: "voice",
       icon: <Mic size={24} />,
       label: "Voice Mode",
-      onClick: () => setIsTextMode(false),
+      onClick: () => setMode(false),
       active: !isTextMode,
       angle: 0,
       side: "right" as const,
@@ -479,8 +525,8 @@ export default function JarvisUI() {
 
   const glassBtn: CSSProperties = {
     position: "fixed",
-    top: 30,
-    right: 30,
+    top: 34,
+    right: 34,
     zIndex: 100,
     width: 48,
     height: 48,
@@ -497,6 +543,7 @@ export default function JarvisUI() {
 
   const slabW = isMinimized ? 200 : Math.max(0, vp.w - 24);
   const slabH = isMinimized ? 200 : Math.max(0, vp.h - 24);
+  const fadeCenter = "radial-gradient(circle at 50% 50%, transparent 22%, #000 78%)";
 
   return (
     <div
@@ -511,13 +558,16 @@ export default function JarvisUI() {
       }}
     >
       <style>{`
-        html, body { background: #000 !important; margin: 0; }
+        html, body { background: #000 !important; margin: 0; overflow: hidden; }
         @keyframes jv-eq { 0%,100% { transform: scaleY(0.25); } 50% { transform: scaleY(1); } }
         @keyframes jv-pulse { 0% { transform: scale(1); opacity: .7; } 100% { transform: scale(1.55); opacity: 0; } }
         @keyframes jv-blink { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-        @keyframes jv-sheen { 0% { transform: translateX(-140%) skewX(-20deg); } 100% { transform: translateX(340%) skewX(-20deg); } }
+        @keyframes jv-dot { 0%,80%,100% { opacity: .2; } 40% { opacity: 1; } }
+        @keyframes jv-sheen { 0% { transform: translateX(-140%) skewX(-20deg); } 100% { transform: translateX(560%) skewX(-20deg); } }
         .jv-ring { position:absolute; inset:0; border-radius:50%; border:1px solid ${CYAN}; animation: jv-pulse 2s ease-out infinite; pointer-events:none; }
         .jv-input::placeholder { color: rgba(142,245,255,0.4); }
+        .jv-scroll::-webkit-scrollbar { width: 6px; }
+        .jv-scroll::-webkit-scrollbar-thumb { background: rgba(34,229,255,0.25); border-radius: 3px; }
       `}</style>
 
       {/* ===== BLACK STAINED-GLASS SLAB ===== */}
@@ -534,55 +584,54 @@ export default function JarvisUI() {
       >
         <motion.div
           initial={false}
-          animate={{ width: slabW, height: slabH, borderRadius: isMinimized ? 44 : 40 }}
+          animate={{ width: slabW, height: slabH, borderRadius: isMinimized ? 44 : 38 }}
           transition={{ duration: dur, ease }}
           style={{
             position: "relative",
             overflow: "hidden",
             background: `
-              linear-gradient(135deg, rgba(34,229,255,0.07) 0%, transparent 30%),
-              linear-gradient(225deg, rgba(139,92,255,0.10) 0%, transparent 34%),
-              radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,0.07) 0%, transparent 55%),
-              #05070b`,
+              radial-gradient(90% 60% at 10% 0%, rgba(34,229,255,0.11), transparent 60%),
+              radial-gradient(80% 60% at 100% 100%, rgba(139,92,255,0.14), transparent 60%),
+              linear-gradient(180deg, #0a0f16 0%, #04060a 55%, #020305 100%)`,
             boxShadow:
-              "inset 0 0 0 1px rgba(255,255,255,0.09), inset 0 1px 0 rgba(255,255,255,0.22), inset 0 -50px 90px rgba(0,0,0,0.7), inset 0 0 70px rgba(34,229,255,0.05), 0 30px 80px rgba(0,0,0,0.9)",
+              "inset 0 0 0 1px rgba(255,255,255,0.08), inset 0 1px 0 rgba(255,255,255,0.2), inset 0 -60px 100px rgba(0,0,0,0.65), 0 30px 80px rgba(0,0,0,0.9)",
           }}
         >
-          {/* leaded stained-glass facets */}
           <svg
-            viewBox="0 0 100 100"
-            preserveAspectRatio="none"
-            style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+            width="100%"
+            height="100%"
+            style={{ position: "absolute", inset: 0, maskImage: fadeCenter, WebkitMaskImage: fadeCenter }}
           >
-            <polygon points="0,0 38,0 0,34" fill="rgba(34,229,255,0.05)" />
-            <polygon points="100,0 62,0 100,40" fill="rgba(139,92,255,0.07)" />
-            <polygon points="0,100 0,66 30,100" fill="rgba(139,92,255,0.06)" />
-            <polygon points="100,100 70,100 100,62" fill="rgba(34,229,255,0.05)" />
-            <polygon points="38,0 62,0 50,22" fill="rgba(255,255,255,0.03)" />
-            <path
-              d="M0 34 L38 0 M100 40 L62 0 M0 66 L30 100 M100 62 L70 100 M38 0 L50 22 L62 0 M50 22 L50 38"
-              stroke="rgba(160,230,255,0.13)"
-              strokeWidth="1"
-              fill="none"
-              vectorEffect="non-scaling-stroke"
-            />
+            <defs>
+              <pattern id="jv-lattice" width="64" height="64" patternUnits="userSpaceOnUse">
+                <path d="M0 32 L32 0 L64 32 L32 64 Z" fill="none" stroke="rgba(120,215,255,0.09)" strokeWidth="1" />
+              </pattern>
+            </defs>
+            <rect width="100%" height="100%" fill="url(#jv-lattice)" />
           </svg>
 
-          {/* moving specular sheen */}
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              background: "linear-gradient(180deg, rgba(255,255,255,0.07) 0%, transparent 22%)",
+            }}
+          />
+
           <div
             style={{
               position: "absolute",
               top: 0,
               bottom: 0,
               left: 0,
-              width: "22%",
-              background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.06), transparent)",
-              animation: "jv-sheen 9s linear infinite",
+              width: "16%",
+              background: "linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent)",
+              animation: "jv-sheen 10s linear infinite",
             }}
           />
 
-          {/* ambient glow (cross-fades cyan/orange with state) */}
-          {[CYAN, ORANGE].map((c) => (
+          {/* ambient glow (cross-fades cyan / orange / red with state) */}
+          {[CYAN, ORANGE, RED].map((c) => (
             <div
               key={c}
               style={{
@@ -600,6 +649,13 @@ export default function JarvisUI() {
               }}
             />
           ))}
+
+          <div style={{ opacity: isMinimized ? 0 : 1, transition: "opacity 0.4s" }}>
+            <Bracket pos="tl" color={accent} />
+            <Bracket pos="tr" color={accent} />
+            <Bracket pos="bl" color={accent} />
+            <Bracket pos="br" color={accent} />
+          </div>
         </motion.div>
       </div>
 
@@ -608,8 +664,8 @@ export default function JarvisUI() {
         initial={false}
         animate={
           isMinimized
-            ? { scale: miniScale, x: 0, y: 0, opacity: isSilent ? 0.4 : 1 }
-            : { scale: 1, x: 0, y: 0, opacity: 1 }
+            ? { scale: miniScale, x: 0, y: 0, opacity: dim ? 0.4 : 1 }
+            : { scale: 1, x: 0, y: 0, opacity: !isOnline ? 0.5 : 1 }
         }
         whileHover={isMinimized ? { scale: miniScale * 1.12 } : undefined}
         transition={{ duration: dur, ease }}
@@ -626,12 +682,17 @@ export default function JarvisUI() {
         }}
       >
         <div style={{ position: "absolute", inset: 0 }}>
-          <Canvas camera={{ position: [0, 0, 6], fov: 50 }} dpr={[1, 2]} style={{ width: "100%", height: "100%" }}>
+          <Canvas
+            camera={{ position: [0, 0, 6], fov: 50 }}
+            dpr={[1, 2]}
+            resize={{ offsetSize: true, scroll: false }}
+            style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+          >
             <Hologram state={hologramState} isMinimized={isMinimized} hoveredButton={isMinimized ? null : hoveredButton} />
           </Canvas>
         </div>
 
-        {/* centre status text, above the particles */}
+        {/* centre status text */}
         <AnimatePresence>
           {!isMinimized && (
             <motion.div
@@ -688,9 +749,9 @@ export default function JarvisUI() {
                         boxShadow: `0 0 8px ${accent}`,
                         transformOrigin: "center",
                         transform: "scaleY(0.2)",
-                        opacity: statusLabel === "STANDBY" ? 0.35 : 1,
+                        opacity: statusLabel === "STANDBY" || !isOnline ? 0.35 : 1,
                         animation:
-                          statusLabel === "STANDBY"
+                          statusLabel === "STANDBY" || !isOnline
                             ? "none"
                             : `jv-eq ${isProcessing ? 0.5 : 1.1}s ease-in-out ${i * 0.09}s infinite`,
                       }}
@@ -721,7 +782,9 @@ export default function JarvisUI() {
                       animation: "jv-blink 1.6s ease-in-out infinite",
                     }}
                   />
-                  {(isTextMode ? "TEXT" : "VOICE") + " LINK · " + engineShown.toUpperCase() + (memoryOn ? " · MEMORY ON" : "")}
+                  {!isOnline
+                    ? "ALL SYSTEMS OFFLINE"
+                    : (isTextMode ? "TEXT" : "VOICE") + " LINK · " + engineShown.toUpperCase() + (memoryOn ? " · MEMORY ON" : "")}
                 </div>
               </div>
             </motion.div>
@@ -774,7 +837,7 @@ export default function JarvisUI() {
               exit={{ opacity: 0, y: -8 }}
               style={{
                 position: "absolute",
-                left: S / 2 - radius - 90,
+                left: Math.max(8, S / 2 - radius - 90),
                 top: S / 2 + 56,
                 width: 180,
                 zIndex: 40,
@@ -853,13 +916,13 @@ export default function JarvisUI() {
           width: MINI,
           height: MINI,
           borderRadius: "50%",
-          border: "1px solid rgba(34,229,255,0.28)",
-          boxShadow: "0 0 30px rgba(34,229,255,0.2), inset 0 0 30px rgba(34,229,255,0.08)",
+          border: `1px solid ${!isOnline ? "rgba(255,84,112,0.4)" : "rgba(34,229,255,0.28)"}`,
+          boxShadow: `0 0 30px ${!isOnline ? "rgba(255,84,112,0.2)" : "rgba(34,229,255,0.2)"}, inset 0 0 30px rgba(34,229,255,0.08)`,
           display: "grid",
           placeItems: "center",
           pointerEvents: "none",
           zIndex: 40,
-          opacity: isMinimized ? (isSilent ? 0.4 : 1) : 0,
+          opacity: isMinimized ? (dim ? 0.4 : 1) : 0,
           transition: "opacity 0.5s ease",
           transitionDelay: isMinimized ? "0.5s" : "0s",
         }}
@@ -875,13 +938,13 @@ export default function JarvisUI() {
         />
       </div>
 
-      {/* TEXT MODE PANEL */}
+      {/* TEXT MODE PANEL (live chat with Jarvis) */}
       <AnimatePresence>
         {isTextMode && !isMinimized && (
           <div
             style={{
               position: "fixed",
-              bottom: 36,
+              bottom: 40,
               left: 0,
               right: 0,
               display: "flex",
@@ -895,30 +958,43 @@ export default function JarvisUI() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 30 }}
               style={{
-                width: Math.min(520, vp.w - 56),
-                height: 230,
+                width: Math.min(560, vp.w - 80),
+                height: Math.min(300, Math.max(200, vp.h * 0.36)),
                 display: "flex",
                 flexDirection: "column",
                 padding: 20,
                 borderRadius: 18,
                 pointerEvents: "auto",
-                background: "rgba(2,5,8,0.82)",
+                background: "rgba(2,5,8,0.86)",
                 backdropFilter: "blur(20px)",
                 WebkitBackdropFilter: "blur(20px)",
-                border: "1px solid rgba(34,229,255,0.3)",
-                boxShadow: "0 0 30px rgba(34,229,255,0.12), inset 0 1px 0 rgba(255,255,255,0.1)",
+                border: `1px solid ${accent}55`,
+                boxShadow: `0 0 30px ${accent}20, inset 0 1px 0 rgba(255,255,255,0.1)`,
                 fontFamily: MONO,
               }}
             >
-              <div style={{ flex: 1, overflowY: "auto", fontSize: 13, color: "rgba(200,250,255,0.85)" }}>
-                {messages.map((m, i) => (
-                  <p key={i} style={{ margin: "0 0 10px" }}>
-                    <span style={{ color: m.from === "jarvis" ? CYAN : ORANGE, fontWeight: 700 }}>
-                      {m.from === "jarvis" ? "Jarvis:" : "You:"}
-                    </span>{" "}
-                    {m.text}
+              <div className="jv-scroll" style={{ flex: 1, overflowY: "auto", fontSize: 13, color: "rgba(200,250,255,0.88)" }}>
+                {messages.length === 0 && (
+                  <p style={{ margin: 0, color: "rgba(142,245,255,0.45)" }}>
+                    Chat link ready. Type anything, or ask me to switch engine, go offline, remember this…
                   </p>
+                )}
+                {messages.map((m) => (
+                  <div key={m.id} style={{ margin: "0 0 12px", whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: 1.5 }}>
+                    <span style={{ color: m.from === "jarvis" ? CYAN : ORANGE, fontWeight: 700 }}>
+                      {m.from === "jarvis" ? "Jarvis" : "You"}
+                    </span>
+                    <span style={{ color: "rgba(255,255,255,0.3)" }}>{"  ›  "}</span>
+                    {m.text}
+                  </div>
                 ))}
+                {isProcessing && lastIsYou && (
+                  <div style={{ color: CYAN, letterSpacing: "0.3em" }}>
+                    {[0, 1, 2].map((i) => (
+                      <span key={i} style={{ animation: `jv-dot 1.2s ${i * 0.2}s infinite` }}>●</span>
+                    ))}
+                  </div>
+                )}
                 <div ref={chatEndRef} />
               </div>
               <div
@@ -928,7 +1004,7 @@ export default function JarvisUI() {
                   gap: 10,
                   marginTop: 12,
                   paddingTop: 12,
-                  borderTop: "1px solid rgba(34,229,255,0.3)",
+                  borderTop: `1px solid ${accent}55`,
                 }}
               >
                 <input
@@ -937,7 +1013,7 @@ export default function JarvisUI() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                  placeholder="Type command, Sir..."
+                  placeholder="Type to Jarvis…"
                   style={{
                     flex: 1,
                     background: "transparent",
@@ -954,7 +1030,7 @@ export default function JarvisUI() {
                     background: "none",
                     border: "none",
                     cursor: "pointer",
-                    color: CYAN,
+                    color: accent,
                     display: "grid",
                     placeItems: "center",
                     padding: 4,
