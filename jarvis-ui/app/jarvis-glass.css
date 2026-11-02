@@ -1,0 +1,10 @@
+:root {
+  --hand-scale: 1;
+  --hand-x: 0px;
+  --hand-y: 0px;
+}
+
+@keyframes jv-scan {
+  from { background-position: 0 0; }
+  to { background-position: 0 80px; }
+}

@@ -1,4 +1,4 @@
-import asyncio, os, time, json, threading, queue, re, io, random, collections, ctypes
+import asyncio, os, time, json, threading, queue, re, io, random, collections, ctypes, subprocess
 from datetime import datetime
 import numpy as np
 import sounddevice as sd
@@ -12,7 +12,7 @@ from google import genai
 from google.genai import types
 from groq import Groq
 
-try:                                   # optional but recommended: pip install webrtcvad-wheels
+try:                                   
     import webrtcvad
     _vad = webrtcvad.Vad(2)
 except Exception:
@@ -25,17 +25,17 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # ---------- CONFIG ----------
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"]   # real names are auto-discovered at startup
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"]   
 GROQ_MODEL = "openai/gpt-oss-20b"
-ROUTER_MODEL = "llama-3.1-8b-instant"      # tiny + fast: decides what each message MEANS
+ROUTER_MODEL = "llama-3.1-8b-instant"      
 OLLAMA_MODEL = "llama3"
 VOICE = "bm_george"
 FS, FRAME, TTS_SR = 16000, 480, 24000
-END_FRAMES = 17                            # ~0.5 s of quiet ends your sentence
-MIN_VOICED_FRAMES = 8                      # ignore sounds shorter than ~0.25 s (kills "Thank you." hallucinations)
+END_FRAMES = 17                            
+MIN_VOICED_FRAMES = 8                      
 BARGE_MODE = True
 BARGE_MIN = 0.02
-LEAD = 0.9
+LEAD = 0.55
 MEM_FILE = "jarvis_memory.json"
 
 try:
@@ -72,18 +72,18 @@ def system_prompt(voice=True):
     return f"{PERSONA}\n{STYLE_VOICE if voice else STYLE_TEXT}\nIt is {datetime.now().strftime('%A, %I:%M %p')}.\n{mem}"
 
 # ---------- STATE ----------
-state = "listening"
-mini = False            # minimised?
-silent = False          # minimised + muted ("wait"): only a wake request gets through
-ui_mini = False         # what the UI shows (lags during window animation)
-online = True           # False => Jarvis refuses to answer anything
-text_mode = False       # chat panel open
-output_pref = "auto"    # auto | voice | text  (how answers are delivered)
+state = "standby"
+mini = False            
+silent = False          
+ui_mini = False         
+online = True           
+text_mode = False       
+output_pref = "auto"    
 forced_engine = "Auto"
 active = {"name": "Auto", "model": ""}
 main_window = None
 connected_clients = set()
-text_queue = queue.Queue()      # items: (text, "text")
+text_queue = queue.Queue()      
 ws_loop = None
 win_lock = threading.Lock()
 noise, echo_g, barge_boost = 0.004, 0.6, 1.0
@@ -121,7 +121,6 @@ def set_memory(on):
     if on: stored.extend(recent)
     memory_on = on
     disk_write(); push_state()
-    print(f"[Memory {'ON' if on else 'OFF'}]")
 
 def wipe_memory():
     stored.clear(); disk_write(); push_state()
@@ -156,10 +155,20 @@ def set_text_mode(on):
     global text_mode
     text_mode = bool(on); push_state()
 
+def set_output_preference(mode):
+    global output_pref
+    value = str(mode or "").strip().lower()
+    if value not in ("voice", "text", "auto"):
+        print(f"[Output preference error: unsupported mode {mode!r}]")
+        return False
+    output_pref = value
+    push_state()
+    return True
+
 async def ws_handler(websocket):
     connected_clients.add(websocket)
     await websocket.send(state_msg())
-    for mid, (who, text) in list(chat_log.items()):          # replay history after a UI reload
+    for mid, (who, text) in list(chat_log.items()):          
         await websocket.send(json.dumps({"action": "chat", "id": mid, "from": who, "text": text}))
     try:
         async for message in websocket:
@@ -169,6 +178,9 @@ async def ws_handler(websocket):
                 elif a == "set_engine": threading.Thread(target=ui_engine, args=(d.get("engine", "Auto"),), daemon=True).start()
                 elif a == "set_memory": set_memory(bool(d.get("on")))
                 elif a == "set_mode": set_text_mode(bool(d.get("text")))
+                elif a == "set_output": set_output_preference(d.get("mode"))
+                elif a == "set_mute":
+                    set_silent(d.get("muted", False))
                 elif a == "ui":
                     if d.get("do") == "minimize": act_minimize(False)
                     elif d.get("do") == "maximize": act_maximize()
@@ -221,10 +233,25 @@ def window_to_center():
         time.sleep(0.15)
         ui_mini = False; push_state()
 
+def set_silent(value):
+    global silent
+    silent = bool(value)
+    if MIC is not None:
+        try:
+            MIC.set_muted(silent)
+        except Exception as e:
+            print(f"[Microphone mute error: {e}]")
+    push_state()
+
 def act_minimize(mute):
     global mini, silent
     was = mini
     mini, silent = True, bool(mute)
+    if MIC is not None:
+        try:
+            MIC.set_muted(silent)
+        except Exception as e:
+            print(f"[Microphone mute error: {e}]")
     if not was: threading.Thread(target=window_to_corner, daemon=True).start()
     else: push_state()
 
@@ -232,10 +259,15 @@ def act_maximize():
     global mini, silent
     was = mini
     mini, silent = False, False
+    if MIC is not None:
+        try:
+            MIC.set_muted(False)
+        except Exception as e:
+            print(f"[Microphone unmute error: {e}]")
     if was: threading.Thread(target=window_to_center, daemon=True).start()
     else: push_state()
 
-# ---------- AUDIO CORE: ONE persistent mic stream + ONE persistent speaker stream ----------
+# ---------- AUDIO CORE ----------
 def rms(x): return float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
 
 def is_voice(frame):
@@ -248,14 +280,28 @@ def is_voice(frame):
 class Mic:
     def __init__(self):
         self.q = queue.Queue(maxsize=300)
+        self.muted = False
         self.stream = sd.InputStream(samplerate=FS, channels=1, dtype="float32", blocksize=FRAME, callback=self._cb)
         self.stream.start()
     def _cb(self, indata, frames, tinfo, status):
+        if self.muted:
+            return
         x = indata[:, 0].copy()
         try: self.q.put_nowait(x)
         except queue.Full:
             try: self.q.get_nowait(); self.q.put_nowait(x)
             except Exception: pass
+    def set_muted(self, muted):
+        muted = bool(muted)
+        if muted == self.muted: return
+        if muted:
+            self.muted = True
+            self.flush()
+            if self.stream.active: self.stream.stop()
+        else:
+            if not self.stream.active: self.stream.start()
+            self.flush()
+            self.muted = False
     def read(self, timeout=0.1):
         try: return self.q.get(timeout=timeout)
         except queue.Empty: return None
@@ -271,10 +317,18 @@ class Speaker:
         self.cur, self.pos, self.queued = None, 0, 0
         self.gain, self.target, self.pausing = 1.0, 1.0, False
         self.hist = collections.deque(maxlen=120)
+        self.last_callback_status = ""
         self.stream = sd.OutputStream(samplerate=TTS_SR, channels=1, dtype="float32",
                                       blocksize=512, latency=0.15, callback=self._cb)
         self.stream.start()
     def _cb(self, outdata, frames, tinfo, status):
+        if status:
+            message = str(status)
+            if message != self.last_callback_status:
+                print(f"[Audio output warning: {message}]")
+                self.last_callback_status = message
+        elif self.last_callback_status:
+            self.last_callback_status = ""
         buf = outdata[:, 0]
         n = 0
         if not (self.pausing and self.gain < 0.03):
@@ -310,7 +364,7 @@ MIC = SPK = None
 
 def init_audio():
     global MIC, SPK
-    SPK = Speaker(); MIC = Mic()
+    SPK = Speaker(); MIC = Mic(); MIC.set_muted(silent)
 
 def calibrate_noise():
     global noise
@@ -321,9 +375,8 @@ def calibrate_noise():
         if f is None: break
         vals.append(rms(f))
     if vals: noise = max(0.002, float(np.median(vals)))
-    print(f"[Mic ambient level: {noise:.4f} | VAD: {'on' if _vad else 'off (pip install webrtcvad-wheels)'}]")
 
-def speech_thr(): return max(0.012, noise * 3.0)
+def speech_thr(): return max(0.009, noise * 2.5)
 
 # ---------- EARS ----------
 def clean(t): return re.sub(r"[^\w\s]", "", t.lower()).strip()
@@ -334,13 +387,15 @@ def transcribe(audio):
     try:
         r = groq_client.audio.transcriptions.create(
             file=("audio.wav", buf.getvalue()), model="whisper-large-v3-turbo", language="en",
-            response_format="verbose_json", prompt="Hey Jarvis.", temperature=0)
+            response_format="verbose_json",
+            prompt="J.A.R.V.I.S. Jarvis. Gemini, Groq, Ollama. Mute, unmute, stop listening, start listening, text mode, voice mode, memory, minimize, maximize.",
+            temperature=0)
         text = (getattr(r, "text", None) or (r.get("text") if isinstance(r, dict) else "") or "").strip()
         segs = getattr(r, "segments", None) or (r.get("segments") if isinstance(r, dict) else None) or []
         def g(s, k):
             v = s.get(k) if isinstance(s, dict) else getattr(s, k, None)
             return 0.0 if v is None else v
-        if segs and all(g(s, "no_speech_prob") > 0.5 for s in segs):     # Whisper itself says "this is silence"
+        if segs and all(g(s, "no_speech_prob") > 0.5 for s in segs):     
             return None
         return text if len(text) > 1 else None
     except Exception as e:
@@ -351,11 +406,26 @@ def listen_fast():
     set_state("listening")
     ring, pre = collections.deque(maxlen=8), collections.deque(maxlen=10)
     frames, trig, quiet, voiced_n, t0 = [], False, 0, 0, time.time()
+    muted = False
     while True:
         if not text_queue.empty(): return None
+        if silent:
+            if not muted:
+                MIC.flush()
+                set_state("standby")
+                muted = True
+            time.sleep(0.2)
+            continue
+        if muted:
+            MIC.flush()
+            set_state("listening")
+            muted = False
         f = MIC.read(0.1)
         if f is None:
             if not trig and time.time() - t0 > 20: return None
+            continue
+        if silent:
+            MIC.flush()
             continue
         r = rms(f)
         voiced = r > speech_thr() and is_voice(f)
@@ -380,7 +450,6 @@ def listen_fast():
 
 # ---------- ENGINES ----------
 def discover_gemini():
-    """Find real Gemini model names for this API key and add them as fallbacks."""
     try:
         found = []
         for m in client.models.list():
@@ -391,7 +460,6 @@ def discover_gemini():
                 found.append(n)
         for n in sorted(found, reverse=True)[:3]:
             if n not in GEMINI_MODELS: GEMINI_MODELS.append(n)
-        print(f"[Gemini models: {GEMINI_MODELS}]")
     except Exception as e:
         print(f"[Gemini discovery skipped: {e}]")
 
@@ -418,7 +486,6 @@ def gemini_stream(msgs):
                 if ch.text: got = True; yield ch.text
             return
         except Exception as e:
-            print(f"[Gemini {model} error: {e}]")
             last = e
             if got: return
     raise last
@@ -433,7 +500,6 @@ def ollama_stream(msgs):
 ENGINES = {"Groq": groq_stream, "Gemini": gemini_stream, "Ollama": ollama_stream}
 
 def engine_ok(name):
-    """Health check used when switching engines. Returns (ok, short reason)."""
     try:
         if name == "Ollama":
             try:
@@ -453,15 +519,14 @@ def engine_ok(name):
                                                    config=types.GenerateContentConfig(max_output_tokens=8))
                     GEMINI_MODELS.remove(m); GEMINI_MODELS.insert(0, m)
                     return True, ""
-                except Exception as e:
-                    print(f"[Gemini check {m}: {e}]")
+                except Exception:
+                    pass
             return False, "it isn't responding."
-    except Exception as e:
-        print(f"[{name} check error: {e}]")
+    except Exception:
+        pass
     return False, "it isn't responding."
 
 def do_engine(name):
-    """Switch engine. Returns a message to say/type if it did NOT work, else None."""
     global forced_engine
     key = (name or "").strip().lower()
     names = {"auto": "Auto", "gemini": "Gemini", "groq": "Groq", "ollama": "Ollama"}
@@ -493,8 +558,7 @@ def llm_stream(msgs, deep):
                     push_chat(new_id(), "jarvis", f"Note: {order[0]} didn't respond, so I answered with {name}.")
                 got = True; yield piece
             if got: return
-        except Exception as e:
-            print(f"[{name} error: {e}]")
+        except Exception:
             if got: return
     yield "Sorry, I can't reach any of my brains right now."
 
@@ -512,7 +576,6 @@ def sentences(chunks):
             yield head.strip() + ","; buf, first = tail, False
     if buf.strip(): yield buf.strip()
 
-# ---------- INTENT ROUTER (no hard-coded phrases: the model reads meaning) ----------
 ROUTER_SYS = """You are the intent router for Jarvis, a voice and text assistant. Work out what the user wants from MEANING, never from keywords.
 The input may contain speech-recognition mistakes (Jarvis may appear as "service" or "Travis"); infer charitably.
 
@@ -526,14 +589,14 @@ intent:
 "speak": true only if the user explicitly asks for THIS answer out loud / in voice; false only if they explicitly want it as text; otherwise null.
 
 Actions:
-{"do":"minimize","mute":false}  shrink to the corner orb. mute=true when the user wants Jarvis to pause, hold on, hush or give them a moment (then reply MUST be ""); mute=false when he should stay available and keep helping.
-{"do":"maximize"}  open to the full view / wake up / come on screen. Does NOT change online or offline.
-{"do":"offline"}   stop answering anything until told to return.
-{"do":"online"}    resume answering. Does NOT change the window size or position.
-{"do":"memory","state":"on|off|wipe"}  remember this conversation / stop remembering / erase stored memory.
-{"do":"engine","name":"auto|gemini|groq|ollama"}  switch the AI brain. groq = fastest, gemini = best for complex work, ollama = local model on this PC, auto = Jarvis picks per question.
-{"do":"mode","mode":"text|voice"}  open the text chat (answers arrive as text) or go back to voice.
-{"do":"output","mode":"voice|text|auto"}  standing preference for HOW answers are delivered: always voice, always text, or auto (match how the user asked).
+{"do":"minimize","mute":false} shrink to the corner orb. mute=true when the user wants Jarvis to pause, hold on, hush or give them a moment (then reply MUST be ""); mute=false when he should stay available and keep helping.
+{"do":"maximize"} open to the full view / wake up / come on screen. Does NOT change online or offline.
+{"do":"offline"} stop answering anything until told to return.
+{"do":"online"} resume answering. Does NOT change the window size or position.
+{"do":"memory","state":"on|off|wipe"} remember this conversation / stop remembering / erase stored memory.
+{"do":"engine","name":"auto|gemini|groq|ollama"} switch the AI brain. groq = fastest, gemini = best for complex work, ollama = local model on this PC, auto = Jarvis picks per question.
+{"do":"mode","mode":"text|voice"} open the text chat (answers arrive as text) or go back to voice.
+{"do":"output","mode":"voice|text|auto"} standing preference for HOW answers are delivered: always voice, always text, or auto (match how the user asked).
 
 STATE (given with each input) describes the situation:
 - online=false: Jarvis is offline. Only honour requests that bring him back or move the window (online, maximize, minimize, mode). For anything else addressed to him: intent "command", no actions, and a short reply saying all systems are offline. Talk not for him: "ignore".
@@ -549,7 +612,34 @@ Examples (the user will phrase things differently):
 "explain how TCP congestion control works" -> {"intent":"chat","actions":[],"reply":"","speak":null,"deep":true}
 "no" -> {"intent":"ignore","actions":[],"reply":"","speak":null,"deep":false}"""
 
-OFFLINE_LINES = ["All systems are offline, Sir.", "I'm offline at the moment, Sir.", "Systems are offline, Sir. Bring me back online when you're ready."]
+OFFLINE_LINES = ["All systems are offline, Sir.", "I'm offline at the moment, Sir.", "Systems are offline, Sir."]
+
+CONTROL_REQUEST = re.compile(
+    r"\b(?:mute|unmute|deafen|deaf|stop listening|start listening|listen again|"
+    r"hold on|hush|give me a moment|wake up|bring me back|come back|shut down|"
+    r"go offline|come online|go online|turn (?:(?:the|your) )?(?:mic|microphone) (?:on|off)|"
+    r"(?:enable|disable) (?:(?:the|your) )?(?:mic|microphone)|"
+    r"minimi[sz]e|m[a]ximi[sz]e|"
+    r"(?:switch|change) (?:to )?(?:the )?(?:ai )?(?:engine|model)|"
+    r"(?:faster|best|local) brain|sit in (?:the )?corner|"
+    r"use (?:gemini|groq|ollama|auto)|"
+    r"(?:turn|switch) (?:the )?memory (?:on|off)|"
+    r"remember|forget|wipe (?:my )?memory|clear (?:my )?memory|"
+    r"(?:switch|change|set) (?:to )?(?:text|voice) mode|"
+    r"(?:speak|talk) (?:to me )?(?:in )?(?:text|voice)|"
+    r"(?:answer|respond|reply) (?:in )?(?:text|voice)|"
+    r"go quiet|stop talking|be quiet)\b",
+    re.IGNORECASE,
+)
+DEEP_REQUEST = re.compile(
+    r"\b(?:in depth|deep dive|comprehensive|thorough|step by step|research)\b",
+    re.IGNORECASE,
+)
+OUTPUT_REQUEST = re.compile(
+    r"\b(?:always\s+)?(?:(?:answer|respond|reply)\s+(?:always\s+)?|"
+    r"(?:speak|talk)\s+(?:to me\s+)?(?:always\s+)?)(?:in\s+)?(?P<mode>voice|text)\b",
+    re.IGNORECASE,
+)
 
 def classify(text, source):
     ctx = " | ".join(f"{m['role']}: {m['content'][:90]}" for m in recent[-4:]) or "none"
@@ -573,10 +663,9 @@ def classify(text, source):
             print(f"[Router {model} error: {e}]")
     return {"intent": "chat", "actions": [], "reply": "", "speak": None, "deep": False}
 
-def enforce(route):
-    """Hard guarantees, whatever the router said."""
+def enforce(route, source):
     dos = {a.get("do") for a in route["actions"]}
-    if silent and route["intent"] != "ignore" and not (dos & {"maximize", "online"}):
+    if source == "voice" and silent and route["intent"] != "ignore" and not (dos & {"maximize", "online"}):
         return {**route, "intent": "ignore", "actions": [], "reply": ""}
     if not online:
         route["actions"] = [a for a in route["actions"] if a.get("do") in ("online", "maximize", "minimize", "mode")]
@@ -585,7 +674,6 @@ def enforce(route):
     return route
 
 def run_actions(acts):
-    """Executes actions. Returns a message that replaces the router's reply if something failed."""
     global online, silent, output_pref
     note = None
     for a in acts:
@@ -593,7 +681,13 @@ def run_actions(acts):
         if d == "minimize": act_minimize(bool(a.get("mute")))
         elif d == "maximize": act_maximize()
         elif d == "offline": online = False
-        elif d == "online": online, silent = True, False
+        elif d == "online":
+            online, silent = True, False
+            if MIC is not None:
+                try:
+                    MIC.set_muted(False)
+                except Exception as e:
+                    print(f"[Microphone unmute error: {e}]")
         elif d == "memory":
             s = str(a.get("state", "")).lower()
             if s == "wipe": wipe_memory()
@@ -606,10 +700,22 @@ def run_actions(acts):
     push_state()
     return note
 
-# ---------- MOUTH: smooth playback + echo-proof interruption ----------
 def to_np(a):
     if hasattr(a, "detach"): a = a.detach().cpu().numpy()
     return np.asarray(a, dtype=np.float32).reshape(-1)
+
+def windows_speech_fallback(text):
+    script = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$voice = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        "$text = [Console]::In.ReadToEnd(); "
+        "$voice.Speak($text); "
+        "$voice.Dispose()"
+    )
+    subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        input=text, capture_output=True, text=True, timeout=90, check=True,
+    )
 
 def typed_waiting(): return not text_queue.empty()
 
@@ -655,16 +761,16 @@ def barge_monitor(stop, done, out, said):
                 echo_g = max(echo_g, min(float(np.mean([rms(x) for x in frames])) / lvl_trig, 3.0) * 1.1)
             barge_boost = min(barge_boost * 1.2, 2.5)
             ring.clear(); pre.clear()
-    except Exception as e:
-        print(f"[Barge-in error: {e}]")
+    except Exception:
+        pass
     finally:
         if not stop.is_set(): SPK.resume()
 
 def speak_stream(sent_iter, said, mid):
-    """Speaks sentences as they arrive (and mirrors them to the chat window). Returns what you said if you interrupted."""
     global LEAD
     stop, done, out = threading.Event(), threading.Event(), {"text": None}
     q = queue.Queue(maxsize=12)
+    audio_duration = [0.0]
 
     def put(item):
         while not stop.is_set():
@@ -672,6 +778,8 @@ def speak_stream(sent_iter, said, mid):
             except queue.Full: pass
 
     def synth():
+        synthesis_failed = False
+        fallback_text = ""
         try:
             for sent in sent_iter:
                 if stop.is_set(): break
@@ -680,14 +788,32 @@ def speak_stream(sent_iter, said, mid):
                 said.append(sent); print(f"Jarvis: {sent}")
                 push_chat(mid, "jarvis", " ".join(said))
                 try:
+                    produced_audio = False
                     for _, _, a in kokoro_pipeline(sent, voice=VOICE, speed=1.08):
                         if stop.is_set(): break
-                        put(to_np(a))
+                        audio = to_np(a)
+                        if audio.size:
+                            produced_audio = True
+                            audio_duration[0] += len(audio) / TTS_SR
+                            put(audio)
+                    if not produced_audio and not stop.is_set():
+                        raise RuntimeError("Kokoro returned no audio for the sentence.")
                 except Exception as e:
-                    print(f"[TTS skipped one sentence: {e}]")
+                    synthesis_failed = True
+                    fallback_text = sent
+                    print(f"[TTS synthesis error: {e}]")
+                    break
         except Exception as e:
-            print(f"[LLM error: {e}]")
+            synthesis_failed = True
+            fallback_text = " ".join(said)
+            print(f"[Speech generation error: {e}]")
         finally:
+            if synthesis_failed and fallback_text and not stop.is_set():
+                try:
+                    set_state("speaking")
+                    windows_speech_fallback(fallback_text)
+                except Exception as e:
+                    print(f"[Windows speech fallback error: {e}]")
             put(None)
 
     SPK.resume()
@@ -706,7 +832,7 @@ def speak_stream(sent_iter, said, mid):
         pending.clear(); started = True; set_state("speaking")
 
     while not stop.is_set():
-        if typed_waiting(): stop.set(); break                # a typed message interrupts speech
+        if typed_waiting(): stop.set(); break                
         try:
             a = q.get(timeout=0.05)
         except queue.Empty:
@@ -720,8 +846,13 @@ def speak_stream(sent_iter, said, mid):
             pending.append(a); pend_s += len(a) / TTS_SR
             if pend_s >= lead: begin()
     if not stop.is_set() and pending and not started: begin()
+    playback_deadline = time.monotonic() + max(12.0, audio_duration[0] * 2.5 + 5.0)
     while not stop.is_set() and SPK.queued > 0:
         if typed_waiting(): stop.set(); break
+        if time.monotonic() >= playback_deadline:
+            print(f"[Audio output error: playback queue did not drain ({SPK.queued} samples remain).]")
+            SPK.stop_now()
+            break
         time.sleep(0.02)
     if stop.is_set(): SPK.stop_now()
 
@@ -730,13 +861,12 @@ def speak_stream(sent_iter, said, mid):
 
     done.set()
     if mon: mon.join(timeout=12)
-    set_state("listening")
+    set_state("listening" if online and not silent else "standby")
     if out["text"] is None:
-        time.sleep(0.45); MIC.flush()                        # ignore the room's echo tail
+        time.sleep(0.45); MIC.flush()                        
     return out["text"]
 
 def text_stream(chunks, mid):
-    """Text-only reply: streams into the chat window, keeps newlines/code blocks."""
     buf, last = "", 0.0
     for c in chunks:
         buf += c
@@ -748,16 +878,16 @@ def text_stream(chunks, mid):
     return buf
 
 def want_voice(source, flag):
-    if flag is not None: return flag                         # "say it out loud" / "just type it"
+    if flag is not None: return flag                         
     if output_pref == "voice": return True
     if output_pref == "text": return False
-    return source == "voice" and not text_mode               # auto: match how the user asked
+    return source == "voice" and not text_mode               
 
 def reply_text(text, source, flag=None):
     mid = new_id()
     if want_voice(source, flag): return speak_stream(iter([text]), [], mid)
     push_chat(mid, "jarvis", text); print(f"Jarvis (text): {text}")
-    set_state("listening")
+    set_state("listening" if online and not silent else "standby")
     return None
 
 def say(text):
@@ -770,7 +900,6 @@ def greet():
                           f"Ah, good {tod}. I'm all ears.",
                           f"Systems are up. Good {tod}, Sir. What are we working on?"])
 
-# ---------- MAIN LOOP ----------
 def chat(text, source, route):
     voice = want_voice(source, route["speak"])
     ctx = stored[-40:] if memory_on else recent[-6:]
@@ -792,13 +921,23 @@ def chat(text, source, route):
     return barge
 
 def handle(text, source):
-    """One message from voice or typing. Returns an interruption (voice) to process next, or None."""
     if source == "voice" and (silent or not online) and len(text.split()) > 15:
-        set_state("listening"); return None                  # long talk while muted/offline = background chatter
+        set_state("listening"); return None                  
     if source == "text":
         push_chat(new_id(), "you", text)
         set_state("processing")
-    route = enforce(classify(text, source))
+    output_request = OUTPUT_REQUEST.search(text)
+    if output_request:
+        mode = output_request.group("mode").lower()
+        set_output_preference(mode)
+        reply = "I'll speak my replies aloud from now on." if mode == "voice" else "I'll keep my replies in text from now on."
+        return reply_text(reply, source)
+    if CONTROL_REQUEST.search(text):
+        route = classify(text, source)
+    else:
+        route = {"intent": "chat", "actions": [], "reply": "", "speak": None,
+                 "deep": bool(DEEP_REQUEST.search(text))}
+    route = enforce(route, source)
     if route["intent"] == "ignore":
         set_state("listening"); return None
     if source == "voice": push_chat(new_id(), "you", text)
@@ -816,8 +955,8 @@ def jarvis_brain():
     except Exception as e:
         print(f"[Audio device error: {e}]"); return
     calibrate_noise()
+    set_state("listening")
     threading.Thread(target=discover_gemini, daemon=True).start()
-    list(kokoro_pipeline("Ready.", voice=VOICE))
     pending = say(greet())
     while True:
         if pending: text, src, pending = pending, "voice", None
@@ -827,9 +966,8 @@ def jarvis_brain():
         try:
             pending = handle(text.strip(), src)
         except Exception as e:
-            print(f"[Handler error: {e}]"); set_state("listening")
+            print(f"[Handler error: {e}]"); set_state("listening" if online and not silent else "standby")
 
-# ---------- LAUNCH ----------
 if __name__ == "__main__":
     disk_load()
     threading.Thread(target=start_ws_server, daemon=True).start()
