@@ -1,16 +1,23 @@
-import asyncio, os, time, json, threading, queue, re, io, random, collections, ctypes, subprocess
+import asyncio, os, sys, time, json, threading, queue, re, io, random, collections, ctypes, subprocess
 from datetime import datetime
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
-import requests
-import websockets
-import webview
-from dotenv import load_dotenv
-from kokoro import KPipeline
-from google import genai
-from google.genai import types
-from groq import Groq
+try:
+    import numpy as np
+    import sounddevice as sd
+    import soundfile as sf
+    import requests
+    import websockets
+    import webview
+    from dotenv import load_dotenv
+    from kokoro import KPipeline
+    from google import genai
+    from google.genai import types
+    from groq import Groq
+except ModuleNotFoundError as e:
+    raise SystemExit(
+        f"Jarvis dependency '{e.name}' is unavailable. Start the app with "
+        "Start_Jarvis.bat or run .\\.venv\\Scripts\\python.exe jarvis_core.py "
+        "from the repository folder."
+    ) from e
 
 try:                                   
     import webrtcvad
@@ -43,7 +50,7 @@ try:
 except Exception:
     SW, SH = 1920, 1080
 SMALL = 200
-BIG = int(max(560, min(900, SH - 110, SW - 60)))
+BIG_W, BIG_H = SW, SH
 
 print("[Loading Local Kokoro TTS...]")
 kokoro_pipeline = KPipeline(lang_code="b")
@@ -143,6 +150,9 @@ def set_state(s):
     global state
     state = s; push_state()
 
+def ready_state():
+    return "listening" if online and not silent else "standby"
+
 def set_active(name, model):
     active["name"], active["model"] = name, model; push_state()
 
@@ -182,7 +192,7 @@ async def ws_handler(websocket):
                 elif a == "set_mute":
                     set_silent(d.get("muted", False))
                 elif a == "ui":
-                    if d.get("do") == "minimize": act_minimize(False)
+                    if d.get("do") == "minimize": act_minimize()
                     elif d.get("do") == "maximize": act_maximize()
             except Exception as e:
                 print(f"[WS message error: {e}]")
@@ -228,8 +238,8 @@ def window_to_center():
     if not main_window: return
     with win_lock:
         glide(SW // 2 - SMALL // 2, SH // 2 - SMALL // 2)
-        main_window.resize(BIG, BIG)
-        main_window.move(SW // 2 - BIG // 2, max(10, SH // 2 - BIG // 2 - 20))
+        main_window.resize(BIG_W, BIG_H)
+        main_window.move(0, 0)
         time.sleep(0.15)
         ui_mini = False; push_state()
 
@@ -243,10 +253,12 @@ def set_silent(value):
             print(f"[Microphone mute error: {e}]")
     push_state()
 
-def act_minimize(mute):
+def act_minimize(mute=None):
     global mini, silent
     was = mini
-    mini, silent = True, bool(mute)
+    mini = True
+    if mute is not None:
+        silent = bool(mute)
     if MIC is not None:
         try:
             MIC.set_muted(silent)
@@ -256,14 +268,9 @@ def act_minimize(mute):
     else: push_state()
 
 def act_maximize():
-    global mini, silent
+    global mini
     was = mini
-    mini, silent = False, False
-    if MIC is not None:
-        try:
-            MIC.set_muted(False)
-        except Exception as e:
-            print(f"[Microphone unmute error: {e}]")
+    mini = False
     if was: threading.Thread(target=window_to_center, daemon=True).start()
     else: push_state()
 
@@ -403,7 +410,7 @@ def transcribe(audio):
 
 def listen_fast():
     global noise
-    set_state("listening")
+    set_state(ready_state())
     ring, pre = collections.deque(maxlen=8), collections.deque(maxlen=10)
     frames, trig, quiet, voiced_n, t0 = [], False, 0, 0, time.time()
     muted = False
@@ -418,7 +425,7 @@ def listen_fast():
             continue
         if muted:
             MIC.flush()
-            set_state("listening")
+            set_state(ready_state())
             muted = False
         f = MIC.read(0.1)
         if f is None:
@@ -444,7 +451,7 @@ def listen_fast():
     set_state("processing")
     t = transcribe(np.concatenate(frames))
     if not t or clean(t) in HALLU or not clean(t):
-        set_state("listening"); return None
+        set_state(ready_state()); return None
     print(f"You: {t}")
     return t
 
@@ -640,6 +647,18 @@ OUTPUT_REQUEST = re.compile(
     r"(?:speak|talk)\s+(?:to me\s+)?(?:always\s+)?)(?:in\s+)?(?P<mode>voice|text)\b",
     re.IGNORECASE,
 )
+VOICE_REQUEST = re.compile(
+    r"\b(?:out\s+loud|aloud|in\s+(?:your\s+)?voice|"
+    r"speak\s+(?:this|that|it|the\s+answer)\s+(?:out\s+loud|aloud)|"
+    r"read\s+(?:this|that|it|the\s+answer)\s+(?:out\s+loud|aloud))\b",
+    re.IGNORECASE,
+)
+REPEAT_REQUEST = re.compile(
+    r"\b(?:(?:read|repeat|say)\s+(?:that|it|your\s+(?:last|previous)\s+(?:reply|answer)|"
+    r"the\s+(?:last|previous)\s+(?:reply|answer))|(?:repeat|read)\s+(?:your\s+)?"
+    r"last\s+(?:reply|answer))(?:\s+(?:back\s+)?(?:out\s+loud|aloud|in\s+(?:your\s+)?voice))?\b",
+    re.IGNORECASE,
+)
 
 def classify(text, source):
     ctx = " | ".join(f"{m['role']}: {m['content'][:90]}" for m in recent[-4:]) or "none"
@@ -678,7 +697,7 @@ def run_actions(acts):
     note = None
     for a in acts:
         d = a.get("do")
-        if d == "minimize": act_minimize(bool(a.get("mute")))
+        if d == "minimize": act_minimize(bool(a["mute"]) if "mute" in a else None)
         elif d == "maximize": act_maximize()
         elif d == "offline": online = False
         elif d == "online":
@@ -913,7 +932,7 @@ def chat(text, source, route):
         reply = " ".join(said).strip()
     else:
         reply = text_stream(llm_stream(msgs, route["deep"]), mid)
-        set_state("listening")
+        set_state(ready_state())
     pair = [{"role": "user", "content": text}, {"role": "assistant", "content": reply or "(interrupted)"}]
     recent.extend(pair); del recent[:-12]
     if memory_on:
@@ -922,7 +941,7 @@ def chat(text, source, route):
 
 def handle(text, source):
     if source == "voice" and (silent or not online) and len(text.split()) > 15:
-        set_state("listening"); return None                  
+        set_state(ready_state()); return None
     if source == "text":
         push_chat(new_id(), "you", text)
         set_state("processing")
@@ -932,20 +951,30 @@ def handle(text, source):
         set_output_preference(mode)
         reply = "I'll speak my replies aloud from now on." if mode == "voice" else "I'll keep my replies in text from now on."
         return reply_text(reply, source)
-    if CONTROL_REQUEST.search(text):
+    repeat_text = re.sub(r"^\s*(?:jarvis[,:]?\s+)?", "", text, flags=re.IGNORECASE).strip(" .!?")
+    if REPEAT_REQUEST.fullmatch(repeat_text):
+        previous_reply = next(
+            (message["content"] for message in reversed(recent) if message["role"] == "assistant"),
+            None,
+        )
+        if previous_reply:
+            return reply_text(previous_reply, source, True)
+    if source == "text" or CONTROL_REQUEST.search(text):
         route = classify(text, source)
     else:
         route = {"intent": "chat", "actions": [], "reply": "", "speak": None,
                  "deep": bool(DEEP_REQUEST.search(text))}
+    if VOICE_REQUEST.search(text):
+        route["speak"] = True
     route = enforce(route, source)
     if route["intent"] == "ignore":
-        set_state("listening"); return None
+        set_state(ready_state()); return None
     if source == "voice": push_chat(new_id(), "you", text)
     if route["intent"] == "command":
         note = run_actions(route["actions"])
         reply = note or route["reply"]
         if reply: return reply_text(reply, source, route["speak"])
-        set_state("listening"); return None
+        set_state(ready_state()); return None
     return chat(text, source, route)
 
 def jarvis_brain():
@@ -955,9 +984,9 @@ def jarvis_brain():
     except Exception as e:
         print(f"[Audio device error: {e}]"); return
     calibrate_noise()
-    set_state("listening")
+    set_state("listening" if online and not silent else "standby")
     threading.Thread(target=discover_gemini, daemon=True).start()
-    pending = say(greet())
+    pending = say(greet()) if online and not silent else None
     while True:
         if pending: text, src, pending = pending, "voice", None
         elif not text_queue.empty(): text, src = text_queue.get()
@@ -995,7 +1024,7 @@ if __name__ == "__main__":
 
     print("[Launching Pywebview UI...]")
     main_window = webview.create_window("Jarvis", "http://localhost:3000", frameless=True,
-                                        width=BIG, height=BIG, on_top=True,
-                                        x=(SW - BIG) // 2, y=max(10, (SH - BIG) // 2 - 20))
+                                        width=BIG_W, height=BIG_H, on_top=True,
+                                        x=0, y=0)
     main_window.events.loaded += on_loaded
     webview.start(gui="edgechromium")

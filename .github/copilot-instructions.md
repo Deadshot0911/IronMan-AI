@@ -19,8 +19,7 @@ There is no repository-level Python test or lint runner configured in the root. 
 
 ```bash
 # from repo root
-.\.venv\Scripts\activate
-python jarvis_core.py
+.\.venv\Scripts\python.exe jarvis_core.py
 ```
 
 Or use the bundled Windows launchers:
@@ -30,10 +29,12 @@ Start_Jarvis.bat
 Start_Sentinel.bat
 ```
 
+Run the app with its project virtual-environment interpreter; the system-wide `python` may not have the audio and AI dependencies. If the launcher reports a missing `.venv`, create it and install the project’s Python dependencies before starting Jarvis.
+
 If you need a quick syntax check for Python changes, use:
 
 ```bash
-python -m compileall .
+.\.venv\Scripts\python.exe -m py_compile jarvis_core.py
 ```
 
 ### UI app (`jarvis-ui/`)

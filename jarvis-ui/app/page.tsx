@@ -119,6 +119,10 @@ function Hologram({
   useFrame((frame, delta) => {
     if (!groupRef.current || !outerRef.current) return;
     const t = frame.clock.elapsedTime;
+    const frameDelta = Math.min(delta, 0.1);
+    const rotationEase = 1 - Math.exp(-frameDelta * 12);
+    const positionEase = 1 - Math.exp(-frameDelta * 10);
+    const effectEase = 1 - Math.exp(-frameDelta * 10);
 
     const css = document.documentElement.style;
     const hs = THREE.MathUtils.clamp(parseFloat(css.getPropertyValue("--hand-scale")) || 1, 0.5, 2.4);
@@ -127,18 +131,19 @@ function Hologram({
     const pinching = !!window.__handPinching;
 
     const currentScale = outerRef.current.scale.x;
-    const targetScale = THREE.MathUtils.lerp(currentScale, hs, 1 - Math.exp(-delta * 9));
+    const targetScale = THREE.MathUtils.lerp(currentScale, hs, rotationEase);
     outerRef.current.scale.setScalar(targetScale);
 
     if (pinching) {
-      groupRef.current.rotation.y = THREE.MathUtils.lerp(groupRef.current.rotation.y, hx * 0.85, 0.2);
-      groupRef.current.rotation.x = THREE.MathUtils.lerp(groupRef.current.rotation.x, -hy * 0.65, 0.2);
-      outerRef.current.position.set(hx * 0.55, -hy * 0.4, 0);
+      groupRef.current.rotation.y = THREE.MathUtils.lerp(groupRef.current.rotation.y, hx * 0.85, rotationEase);
+      groupRef.current.rotation.x = THREE.MathUtils.lerp(groupRef.current.rotation.x, -hy * 0.65, rotationEase);
+      outerRef.current.position.x = THREE.MathUtils.lerp(outerRef.current.position.x, hx * 0.55, positionEase);
+      outerRef.current.position.y = THREE.MathUtils.lerp(outerRef.current.position.y, -hy * 0.4, positionEase);
     } else {
-      outerRef.current.position.x = THREE.MathUtils.lerp(outerRef.current.position.x, 0, 0.1);
-      outerRef.current.position.y = THREE.MathUtils.lerp(outerRef.current.position.y, 0, 0.1);
-      groupRef.current.rotation.x += delta * 0.08;
-      groupRef.current.rotation.y += delta * 0.12;
+      outerRef.current.position.x = THREE.MathUtils.lerp(outerRef.current.position.x, 0, positionEase);
+      outerRef.current.position.y = THREE.MathUtils.lerp(outerRef.current.position.y, 0, positionEase);
+      groupRef.current.rotation.x += frameDelta * 0.08;
+      groupRef.current.rotation.y += frameDelta * 0.12;
       groupRef.current.rotation.z = Math.sin(t * 0.3) * 0.1;
     }
 
@@ -152,10 +157,10 @@ function Hologram({
       if (hoveredButton === "engine") targetDir.set(-1, 0, 0);
       const inverseRotation = new THREE.Quaternion().copy(groupRef.current.quaternion).invert();
       targetDir.applyQuaternion(inverseRotation);
-      u.uBulgeDir.value.lerp(targetDir, 0.1);
+      u.uBulgeDir.value.lerp(targetDir, effectEase);
       strength = 1.0;
     }
-    u.uBulgeStrength.value = THREE.MathUtils.lerp(u.uBulgeStrength.value, strength, 0.1);
+    u.uBulgeStrength.value = THREE.MathUtils.lerp(u.uBulgeStrength.value, strength, effectEase);
   });
 
   return (
@@ -475,7 +480,7 @@ export default function JarvisUI() {
   const lastIsYou = messages.length > 0 && messages[messages.length - 1].from === "you";
 
   const compact = vp.w < 320;
-  const S = compact ? vp.w - 30 : Math.max(320, Math.min(700, vp.w - 24, vp.h - 24));
+  const S = compact ? vp.w - 30 : Math.max(320, Math.min(vp.w, vp.h));
   const MINI = 170;
   const miniScale = compact ? 1 : MINI / S;
   const radius = S * 0.37;

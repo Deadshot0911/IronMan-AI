@@ -12,12 +12,15 @@
   let hands = null;
   let stream = null;
   let trackingTimer = 0;
+  let motionFrame = 0;
+  let lastMotionTime = 0;
   let sendingFrame = false;
   let lastVideoTime = -1;
   let calibratedHandSpan = 0;
   let spanSamples = [];
-  let missingTwoHandsFrames = 0;
+  let missingHandFrames = 0;
   let filteredHandSpan = 0;
+  let zoomMode = "";
   let lastReportedMessage = "";
   let scriptWaits = 0;
 
@@ -31,8 +34,12 @@
     state.pinching = false;
     calibratedHandSpan = 0;
     spanSamples = [];
-    missingTwoHandsFrames = 0;
+    missingHandFrames = 0;
     filteredHandSpan = 0;
+    zoomMode = "";
+    smooth.scale = 1;
+    smooth.x = 0;
+    smooth.y = 0;
     smooth.targetScale = 1;
     smooth.targetX = 0;
     smooth.targetY = 0;
@@ -57,6 +64,11 @@
     state.active = false;
     window.clearTimeout(trackingTimer);
     trackingTimer = 0;
+    if (motionFrame) {
+      window.cancelAnimationFrame(motionFrame);
+      motionFrame = 0;
+      lastMotionTime = 0;
+    }
     sendingFrame = false;
     resetGestures();
 
@@ -67,7 +79,10 @@
     if (video) video.srcObject = null;
     if (hands) {
       try {
-        hands.close();
+        const closing = hands.close();
+        if (closing && typeof closing.catch === "function") {
+          closing.catch((error) => console.warn("[Jarvis Vision] Could not close hand tracking:", error));
+        }
       } catch (error) {
         console.warn("[Jarvis Vision] Could not close hand tracking:", error);
       }
@@ -78,37 +93,59 @@
 
   function onHandResults(results) {
     const landmarks = results.multiHandLandmarks || [];
-    if (landmarks.length === 2) {
-      const firstPalm = landmarks[0][9];
-      const secondPalm = landmarks[1][9];
-      const span = Math.hypot(firstPalm.x - secondPalm.x, firstPalm.y - secondPalm.y);
-      missingTwoHandsFrames = 0;
+    if (landmarks.length) {
+      const mode = landmarks.length > 1 ? "two-hands" : "one-hand";
+      const span = mode === "two-hands"
+        ? Math.hypot(landmarks[0][9].x - landmarks[1][9].x, landmarks[0][9].y - landmarks[1][9].y)
+        : Math.sqrt(
+          Math.hypot(
+            landmarks[0][0].x - landmarks[0][9].x,
+            landmarks[0][0].y - landmarks[0][9].y,
+            (landmarks[0][0].z - landmarks[0][9].z) * 0.65,
+          ) *
+          Math.hypot(
+            landmarks[0][5].x - landmarks[0][17].x,
+            landmarks[0][5].y - landmarks[0][17].y,
+            (landmarks[0][5].z - landmarks[0][17].z) * 0.65,
+          ),
+        );
+      if (mode !== zoomMode) {
+        zoomMode = mode;
+        spanSamples = [];
+        calibratedHandSpan = 0;
+        filteredHandSpan = 0;
+        smooth.targetScale = 1;
+      }
+      missingHandFrames = 0;
       if (!calibratedHandSpan) {
         spanSamples.push(span);
         if (spanSamples.length >= 8) {
-          calibratedHandSpan = spanSamples.reduce((sum, value) => sum + value, 0) / spanSamples.length;
+          const orderedSamples = [...spanSamples].sort((a, b) => a - b);
+          calibratedHandSpan = (orderedSamples[3] + orderedSamples[4]) / 2;
           filteredHandSpan = calibratedHandSpan;
         }
       } else {
         filteredHandSpan += (span - filteredHandSpan) * 0.3;
         const zoomRatio = filteredHandSpan / Math.max(calibratedHandSpan, 0.08);
-        smooth.targetScale = Math.max(0.5, Math.min(2.4, Math.pow(zoomRatio, 1.45)));
+        smooth.targetScale = Math.max(0.45, Math.min(2.5, Math.pow(zoomRatio, 1.5)));
       }
     } else {
-      spanSamples = [];
-      missingTwoHandsFrames += 1;
-      if (missingTwoHandsFrames > 45) {
+      missingHandFrames += 1;
+      if (missingHandFrames > 45) {
         calibratedHandSpan = 0;
+        spanSamples = [];
         filteredHandSpan = 0;
+        zoomMode = "";
         smooth.targetScale = 1;
       }
     }
 
     let pinch = null;
+    const pinchThreshold = state.pinching ? 0.085 : 0.065;
     for (const hand of landmarks) {
       const thumb = hand[4];
       const index = hand[8];
-      if (Math.hypot(thumb.x - index.x, thumb.y - index.y) < 0.075) {
+      if (Math.hypot(thumb.x - index.x, thumb.y - index.y) < pinchThreshold) {
         pinch = { x: (thumb.x + index.x) / 2, y: (thumb.y + index.y) / 2 };
         break;
       }
@@ -119,24 +156,31 @@
     if (pinch) {
       smooth.targetX = (0.5 - pinch.x) * 2;
       smooth.targetY = (pinch.y - 0.5) * 2;
-      report("ACTIVE", "CAMERA ACTIVE · MOVE HANDS APART/TOGETHER TO ZOOM · PINCH TO MOVE");
+      report("ACTIVE", "CAMERA ACTIVE · PINCH TO MOVE · MOVE HAND CLOSER/FARTHER OR BOTH HANDS APART TO ZOOM");
     } else {
       smooth.targetX = 0;
       smooth.targetY = 0;
-      report("ACTIVE", landmarks.length ? "CAMERA ACTIVE · MOVE HANDS APART/TOGETHER TO ZOOM · PINCH TO MOVE" : "CAMERA ACTIVE · SHOW YOUR HANDS");
+      const gestureHelp = landmarks.length > 1
+        ? "CAMERA ACTIVE · PINCH TO MOVE · MOVE HANDS APART/TOGETHER TO ZOOM"
+        : "CAMERA ACTIVE · PINCH TO MOVE · MOVE ONE HAND CLOSER/FARTHER TO ZOOM";
+      report("ACTIVE", landmarks.length ? gestureHelp : "CAMERA ACTIVE · SHOW YOUR HANDS");
     }
   }
 
-  function updateSmoothMotion() {
+  function updateSmoothMotion(timestamp) {
     if (!state.active) return;
-    smooth.scale += (smooth.targetScale - smooth.scale) * 0.18;
-    smooth.x += (smooth.targetX - smooth.x) * 0.22;
-    smooth.y += (smooth.targetY - smooth.y) * 0.22;
+    const delta = lastMotionTime ? Math.min((timestamp - lastMotionTime) / 1000, 0.1) : 1 / 60;
+    lastMotionTime = timestamp;
+    const scaleEase = 1 - Math.exp(-delta / 0.11);
+    const positionEase = 1 - Math.exp(-delta / 0.075);
+    smooth.scale += (smooth.targetScale - smooth.scale) * scaleEase;
+    smooth.x += (smooth.targetX - smooth.x) * positionEase;
+    smooth.y += (smooth.targetY - smooth.y) * positionEase;
 
     document.documentElement.style.setProperty("--hand-scale", smooth.scale.toFixed(3));
     document.documentElement.style.setProperty("--hand-x", smooth.x.toFixed(3));
     document.documentElement.style.setProperty("--hand-y", smooth.y.toFixed(3));
-    requestAnimationFrame(updateSmoothMotion);
+    motionFrame = window.requestAnimationFrame(updateSmoothMotion);
   }
 
   async function trackFrames() {
@@ -154,7 +198,7 @@
         sendingFrame = false;
       }
     }
-    if (state.active) trackingTimer = window.setTimeout(trackFrames, 33);
+    if (state.active) trackingTimer = window.setTimeout(trackFrames, 24);
   }
 
   function startCamera() {
@@ -190,7 +234,7 @@
       await cameraVideo.play();
 
       hands = new window.Hands({
-        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
       });
       hands.setOptions({
         maxNumHands: 2,
@@ -200,8 +244,8 @@
       });
       hands.onResults(onHandResults);
       resetGestures();
-      report("ACTIVE", "CAMERA ACTIVE · MOVE HANDS APART/TOGETHER TO ZOOM · PINCH TO MOVE");
-      requestAnimationFrame(updateSmoothMotion);
+      report("ACTIVE", "CAMERA ACTIVE · PINCH TO MOVE · MOVE HAND CLOSER/FARTHER OR BOTH HANDS APART TO ZOOM");
+      if (!motionFrame) motionFrame = window.requestAnimationFrame(updateSmoothMotion);
       void trackFrames();
     }).catch((error) => {
       console.warn("[Jarvis Vision] Camera access failed:", error);
