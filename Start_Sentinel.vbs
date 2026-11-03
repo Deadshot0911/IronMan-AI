@@ -1,3 +1,5 @@
-Set WshShell = CreateObject("WScript.Shell") 
-WshShell.Run chr(34) & "C:\IronMan_AI\Start_Sentinel.bat" & Chr(34), 0
-Set WshShell = Nothing
+Set fileSystem = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+root = fileSystem.GetParentFolderName(WScript.ScriptFullName)
+shell.CurrentDirectory = root
+shell.Run """" & root & "\Start_Sentinel.bat""", 0, False

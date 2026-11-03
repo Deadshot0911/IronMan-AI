@@ -60,6 +60,41 @@
     return video;
   }
 
+  async function requestCamera() {
+    const constraints = {
+      audio: false,
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } },
+    };
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (initialError) {
+      if (!initialError || !["NotReadableError", "AbortError", "OverconstrainedError"].includes(initialError.name)) {
+        throw initialError;
+      }
+
+      let devices;
+      try {
+        devices = await navigator.mediaDevices.enumerateDevices();
+      } catch (enumerationError) {
+        console.warn("[Jarvis Vision] Could not enumerate cameras:", enumerationError);
+        throw initialError;
+      }
+
+      const cameras = devices.filter((device) => device.kind === "videoinput" && device.deviceId);
+      for (const camera of cameras) {
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { deviceId: { exact: camera.deviceId } },
+          });
+        } catch (error) {
+          console.warn(`[Jarvis Vision] Could not open camera ${camera.label || camera.deviceId}:`, error);
+        }
+      }
+      throw initialError;
+    }
+  }
+
   function stopCamera(message) {
     state.active = false;
     window.clearTimeout(trackingTimer);
@@ -220,10 +255,7 @@
 
     state.active = true;
     report("LOADING", "REQUESTING CAMERA ACCESS");
-    navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30, max: 30 } },
-    }).then(async (cameraStream) => {
+    requestCamera().then(async (cameraStream) => {
       if (!state.active || state.minimized || document.hidden) {
         cameraStream.getTracks().forEach((track) => track.stop());
         return;
@@ -253,11 +285,16 @@
         state.active = false;
         return;
       }
-      const message = error && error.name === "NotAllowedError"
-        ? "CAMERA BLOCKED · ALLOW CAMERA ACCESS"
-        : error && error.name === "NotFoundError"
-        ? "NO CAMERA FOUND"
-        : "CAMERA UNAVAILABLE · CHECK DEVICE PERMISSIONS";
+      const errorName = error && error.name;
+      const message = errorName === "NotAllowedError" || errorName === "PermissionDeniedError"
+        ? "CAMERA BLOCKED · ALLOW CAMERA ACCESS FOR JARVIS"
+        : errorName === "NotFoundError" || errorName === "DevicesNotFoundError"
+        ? "NO CAMERA FOUND · CONNECT A CAMERA"
+        : errorName === "NotReadableError" || errorName === "AbortError"
+        ? "CAMERA BUSY · CLOSE OTHER APPS USING THE CAMERA"
+        : errorName === "OverconstrainedError"
+        ? "CAMERA SETTINGS UNSUPPORTED · CHECK CAMERA DEVICE"
+        : "CAMERA ERROR · " + (errorName || "UNKNOWN ERROR") + " · REOPEN THE UI";
       stopCamera(message);
     });
   }
@@ -270,6 +307,11 @@
     else startCamera();
   }
 
+  window.addEventListener("jarvisCameraPermissionReady", function () {
+    if (state.minimized || document.hidden) return;
+    if (state.active) stopCamera("RETRYING CAMERA ACCESS");
+    startCamera();
+  });
   window.addEventListener("jarvisState", updateWindowState);
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) stopCamera("HAND TRACKING · UI NOT VISIBLE");

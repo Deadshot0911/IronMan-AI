@@ -1004,7 +1004,28 @@ if __name__ == "__main__":
     threading.Thread(target=jarvis_brain, daemon=True).start()
 
     def on_loaded():
+        if not getattr(main_window, "_jarvis_camera_permission_handler", None):
+            from System import Action
+            from Microsoft.Web.WebView2.Core import CoreWebView2PermissionState
+
+            def register_camera_permission_handler():
+                core_webview = main_window.native.webview.CoreWebView2
+
+                def on_camera_permission_requested(sender, event):
+                    if (
+                        event.PermissionKind.ToString() == "Camera"
+                        and str(event.Uri).rstrip("/") == "http://localhost:3000"
+                    ):
+                        event.State = CoreWebView2PermissionState.Allow
+
+                # Only grant camera access to Jarvis's exact local UI origin.
+                main_window._jarvis_camera_permission_handler = on_camera_permission_requested
+                core_webview.PermissionRequested += main_window._jarvis_camera_permission_handler
+
+            main_window.native.Invoke(Action(register_camera_permission_handler))
+
         main_window.evaluate_js("""
+        window.__jarvisCameraPermissionReady = true;
         let ws;
         function connect() {
           ws = new WebSocket('ws://localhost:8000');
@@ -1020,6 +1041,7 @@ if __name__ == "__main__":
         const out = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
         window.addEventListener('jarvisCommand', (ev) => out({ action: 'command', text: ev.detail }));
         window.addEventListener('jarvisAction', (ev) => out(ev.detail));
+        window.dispatchEvent(new Event('jarvisCameraPermissionReady'));
         """)
 
     print("[Launching Pywebview UI...]")

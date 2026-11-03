@@ -5,7 +5,7 @@
 This repo is a hybrid desktop + web assistant project:
 
 - `jarvis_core.py` is the primary runtime. It owns the wake/listen flow, audio processing, model routing, websocket state updates, and the embedded PyWebView window that hosts the browser UI.
-- `sentinel.py` is a lightweight wake-word listener. It watches for the name "Jarvis" and launches `Start_Jarvis.bat`.
+- `sentinel.py` is an offline Vosk wake-word listener. It pauses while the Jarvis backend uses the microphone and launches `Start_Jarvis.bat` after hearing "Jarvis".
 - `hologram.py` is a separate PyQt hologram overlay used as a visual shell and input surface.
 - `jarvis-ui/` is a standalone Next.js app that renders the browser UI. It communicates with the Python backend over a local websocket at `ws://localhost:8000`.
 - `vosk-model/` and `vosk-model-small/` contain local speech-model assets. They are not normal application code and should only be touched when updating speech model packaging or assets.
@@ -28,6 +28,8 @@ Or use the bundled Windows launchers:
 Start_Jarvis.bat
 Start_Sentinel.bat
 ```
+
+Run `Install_Jarvis_Startup.bat` once to add the hidden wake listener to the current Windows account's Startup folder. After signing in, say "Jarvis" to start the production UI and assistant together. The bundled `vosk-model-small/` is required for offline wake detection.
 
 Run the app with its project virtual-environment interpreter; the system-wide `python` may not have the audio and AI dependencies. If the launcher reports a missing `.venv`, create it and install the project’s Python dependencies before starting Jarvis.
 

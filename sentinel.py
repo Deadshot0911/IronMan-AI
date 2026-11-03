@@ -1,47 +1,166 @@
-import speech_recognition as sr
+import ctypes
+import json
 import os
+import queue
+import socket
+import subprocess
 import time
-import sys
-from dotenv import load_dotenv
-from groq import Groq
+from datetime import datetime
 
-# Load keys securely from the .env file
-load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-groq_client = Groq(api_key=GROQ_API_KEY)
+import sounddevice as sd
+from vosk import KaldiRecognizer, Model, SetLogLevel
 
-LOCK_FILE = "active.lock"
 
-def listen_for_wake_word():
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 150 
-    recognizer.dynamic_energy_threshold = True
+BASE = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE, "vosk-model-small")
+START_SCRIPT = os.path.join(BASE, "Start_Jarvis.bat")
+LOG_FILE = os.path.join(BASE, "sentinel_log.txt")
+SAMPLE_RATE = 16000
+BLOCK_SIZE = 4000
+WAKE_WORDS = ("jarvis", "jervis", "service")
+BACKEND_ADDRESS = ("127.0.0.1", 8000)
+MUTEX_NAME = "Local\\IronManAISentinel"
+CREATE_NO_WINDOW = 0x08000000
+ERROR_ALREADY_EXISTS = 183
 
-    while True:
-        if os.path.exists(LOCK_FILE):
-            time.sleep(1)
-            continue
 
+def log(message):
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as file:
+            file.write(f"[{timestamp}] {message}\n")
+    except OSError:
+        pass
+
+
+def acquire_single_instance():
+    handle = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    if not handle:
+        raise ctypes.WinError()
+    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def jarvis_is_running():
+    try:
+        with socket.create_connection(BACKEND_ADDRESS, timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def wake_word_heard(model):
+    audio_queue = queue.Queue(maxsize=24)
+    recognizer = KaldiRecognizer(
+        model,
+        SAMPLE_RATE,
+        json.dumps([*WAKE_WORDS, "[unk]"]),
+    )
+
+    def receive_audio(indata, frames, timing, status):
         try:
-            with sr.Microphone() as source:
-                audio = recognizer.listen(source, timeout=3, phrase_time_limit=3)
-                
-            text = recognizer.recognize_google(audio).lower()
-            print(f"[Sentinel heard]: {text}")
-            
-            if "jarvis" in text:
-                print("[Wake word detected! Launching Jarvis...]")
-                
-                with open(LOCK_FILE, "w") as f:
-                    f.write("running")
-                
-                os.system("start Start_Jarvis.bat")
-                sys.exit(0) 
-                
-        except sr.WaitTimeoutError:
+            audio_queue.put_nowait(bytes(indata))
+        except queue.Full:
             pass
-        except Exception:
-            pass
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        blocksize=BLOCK_SIZE,
+        dtype="int16",
+        channels=1,
+        callback=receive_audio,
+    ):
+        log("Wake listener ready. Say Jarvis to start.")
+        while not jarvis_is_running():
+            try:
+                audio = audio_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            if recognizer.AcceptWaveform(audio):
+                result = json.loads(recognizer.Result())
+                text = result.get("text", "").lower()
+            else:
+                result = json.loads(recognizer.PartialResult())
+                text = result.get("partial", "").lower()
+
+            if any(word in text.split() for word in WAKE_WORDS):
+                log(f"Wake word detected: {text}")
+                return True
+    return False
+
+
+def launch_jarvis():
+    log("Starting Jarvis UI and assistant.")
+    with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            [os.environ.get("COMSPEC", "cmd.exe"), "/c", START_SCRIPT],
+            cwd=BASE,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+    startup_deadline = time.monotonic() + 180
+    while time.monotonic() < startup_deadline:
+        if jarvis_is_running():
+            log("Jarvis is online. Wake listener is pausing while Jarvis uses the microphone.")
+            while jarvis_is_running():
+                time.sleep(2)
+            log("Jarvis stopped. Wake listener is active again.")
+            return
+        if process.poll() is not None:
+            log(f"Jarvis launcher exited with code {process.returncode} before the backend started.")
+            return
+        time.sleep(1)
+
+    log("Timed out waiting for the Jarvis backend to start.")
+
+
+def main():
+    if os.name != "nt":
+        raise RuntimeError("The automatic Jarvis wake listener is supported on Windows.")
+    if not os.path.isdir(MODEL_DIR):
+        raise FileNotFoundError(f"Bundled wake-word model not found: {MODEL_DIR}")
+
+    mutex = acquire_single_instance()
+    if mutex is None:
+        log("A wake listener is already running; exiting the duplicate instance.")
+        return
+
+    try:
+        SetLogLevel(-1)
+        log("Loading the bundled offline wake-word model.")
+        model = Model(MODEL_DIR)
+        log("Offline wake-word model loaded.")
+        waiting_for_jarvis = False
+        while True:
+            if jarvis_is_running():
+                if not waiting_for_jarvis:
+                    log("Jarvis is already online; wake listener is waiting.")
+                    waiting_for_jarvis = True
+                time.sleep(2)
+                continue
+            if waiting_for_jarvis:
+                log("Jarvis is offline; wake listener is active.")
+                waiting_for_jarvis = False
+            try:
+                if wake_word_heard(model):
+                    launch_jarvis()
+            except Exception as error:
+                log(f"Wake listener error: {error}")
+                time.sleep(5)
+    finally:
+        ctypes.windll.kernel32.ReleaseMutex(mutex)
+        ctypes.windll.kernel32.CloseHandle(mutex)
+
 
 if __name__ == "__main__":
-    listen_for_wake_word()
+    try:
+        main()
+    except Exception as error:
+        log(f"Fatal wake listener error: {error}")
+        raise

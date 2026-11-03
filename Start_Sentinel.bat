@@ -1,11 +1,11 @@
 @echo off
+setlocal
 cd /d "%~dp0"
-if not exist ".venv\Scripts\python.exe" (
+if not exist ".venv\Scripts\pythonw.exe" (
     echo Jarvis virtual environment not found.
     echo Run: python -m venv .venv
-    echo Then install the project dependencies into .venv before starting Sentinel.
-    pause
+    echo Then install the project dependencies into .venv before starting the wake listener.
     exit /b 1
 )
-start "" /min "%~dp0.venv\Scripts\python.exe" "%~dp0sentinel.py"
+start "" /b "%~dp0.venv\Scripts\pythonw.exe" "%~dp0sentinel.py"
 exit
