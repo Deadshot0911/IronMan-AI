@@ -1,4 +1,5 @@
 import asyncio, os, sys, time, json, threading, queue, re, io, random, collections, ctypes, subprocess
+from ctypes import wintypes
 from datetime import datetime
 try:
     import numpy as np
@@ -46,8 +47,17 @@ LEAD = 0.55
 MEM_FILE = "jarvis_memory.json"
 
 try:
-    SW, SH = ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
+    work_area = wintypes.RECT()
+    if ctypes.windll.user32.SystemParametersInfoW(
+        0x0030, 0, ctypes.byref(work_area), 0
+    ):
+        WORK_X, WORK_Y = work_area.left, work_area.top
+        SW, SH = work_area.right - work_area.left, work_area.bottom - work_area.top
+    else:
+        WORK_X = WORK_Y = 0
+        SW, SH = ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
 except Exception:
+    WORK_X = WORK_Y = 0
     SW, SH = 1920, 1080
 SMALL = 200
 BIG_W, BIG_H = SW, SH
@@ -184,7 +194,12 @@ async def ws_handler(websocket):
         async for message in websocket:
             try:
                 d = json.loads(message); a = d.get("action")
-                if a == "command": text_queue.put((d.get("text", ""), "text"))
+                if a == "command":
+                    text = d.get("text", "")
+                    if CLOSE_REQUEST.search(text):
+                        close_jarvis()
+                    else:
+                        text_queue.put((text, "text"))
                 elif a == "set_engine": threading.Thread(target=ui_engine, args=(d.get("engine", "Auto"),), daemon=True).start()
                 elif a == "set_memory": set_memory(bool(d.get("on")))
                 elif a == "set_mode": set_text_mode(bool(d.get("text")))
@@ -194,6 +209,7 @@ async def ws_handler(websocket):
                 elif a == "ui":
                     if d.get("do") == "minimize": act_minimize()
                     elif d.get("do") == "maximize": act_maximize()
+                    elif d.get("do") == "close": close_jarvis()
             except Exception as e:
                 print(f"[WS message error: {e}]")
     except websockets.exceptions.ConnectionClosed:
@@ -231,17 +247,24 @@ def window_to_corner():
         cy = main_window.y + main_window.height // 2
         main_window.resize(SMALL, SMALL)
         main_window.move(cx - SMALL // 2, cy - SMALL // 2)
-        glide(SW - SMALL - 30, SH - SMALL - 90)
+        glide(WORK_X + SW - SMALL - 30, WORK_Y + SH - SMALL - 30)
 
 def window_to_center():
     global ui_mini
     if not main_window: return
     with win_lock:
-        glide(SW // 2 - SMALL // 2, SH // 2 - SMALL // 2)
+        glide(WORK_X + SW // 2 - SMALL // 2, WORK_Y + SH // 2 - SMALL // 2)
         main_window.resize(BIG_W, BIG_H)
-        main_window.move(0, 0)
+        main_window.move(WORK_X, WORK_Y)
         time.sleep(0.15)
         ui_mini = False; push_state()
+
+def close_jarvis():
+    if main_window:
+        try:
+            main_window.destroy()
+        except Exception as e:
+            print(f"[Jarvis shutdown error: {e}]")
 
 def set_silent(value):
     global silent
@@ -598,6 +621,7 @@ intent:
 Actions:
 {"do":"minimize","mute":false} shrink to the corner orb. mute=true when the user wants Jarvis to pause, hold on, hush or give them a moment (then reply MUST be ""); mute=false when he should stay available and keep helping.
 {"do":"maximize"} open to the full view / wake up / come on screen. Does NOT change online or offline.
+{"do":"close"} close the Jarvis window and assistant process while leaving the separate wake listener running.
 {"do":"offline"} stop answering anything until told to return.
 {"do":"online"} resume answering. Does NOT change the window size or position.
 {"do":"memory","state":"on|off|wipe"} remember this conversation / stop remembering / erase stored memory.
@@ -613,6 +637,7 @@ Compound requests give several actions, e.g. "go offline and sit in the corner" 
 Examples (the user will phrase things differently):
 "hold on a second" -> {"intent":"command","actions":[{"do":"minimize","mute":true}],"reply":"","speak":null,"deep":false}
 "tuck yourself away but keep listening" -> {"intent":"command","actions":[{"do":"minimize","mute":false}],"reply":"Of course, I'll stay close.","speak":null,"deep":false}
+"Jarvis, terminate" -> {"intent":"command","actions":[{"do":"close"}],"reply":"","speak":null,"deep":false}
 "you can shut down for now" -> {"intent":"command","actions":[{"do":"offline"}],"reply":"Going offline, Sir.","speak":null,"deep":false}
 "let's use the faster brain" -> {"intent":"command","actions":[{"do":"engine","name":"groq"}],"reply":"Switching to Groq.","speak":null,"deep":false}
 "tell me a joke out loud" -> {"intent":"chat","actions":[],"reply":"","speak":true,"deep":false}
@@ -622,7 +647,8 @@ Examples (the user will phrase things differently):
 OFFLINE_LINES = ["All systems are offline, Sir.", "I'm offline at the moment, Sir.", "Systems are offline, Sir."]
 
 CONTROL_REQUEST = re.compile(
-    r"\b(?:mute|unmute|deafen|deaf|stop listening|start listening|listen again|"
+    r"\b(?:close|quit|exit|terminate|shutdown|shut down|"
+    r"mute|unmute|deafen|deaf|stop listening|start listening|listen again|"
     r"hold on|hush|give me a moment|wake up|bring me back|come back|shut down|"
     r"go offline|come online|go online|turn (?:(?:the|your) )?(?:mic|microphone) (?:on|off)|"
     r"(?:enable|disable) (?:(?:the|your) )?(?:mic|microphone)|"
@@ -636,6 +662,12 @@ CONTROL_REQUEST = re.compile(
     r"(?:speak|talk) (?:to me )?(?:in )?(?:text|voice)|"
     r"(?:answer|respond|reply) (?:in )?(?:text|voice)|"
     r"go quiet|stop talking|be quiet)\b",
+    re.IGNORECASE,
+)
+CLOSE_REQUEST = re.compile(
+    r"\bjarvis\b.{0,40}\b(?:close|quit|exit|terminate|shutdown|shut down)\b|"
+    r"\b(?:close|quit|exit|terminate|shutdown|shut down)\b.{0,40}\b"
+    r"(?:jarvis|yourself|the app|the application|the ui|this app|the window|this window)\b",
     re.IGNORECASE,
 )
 DEEP_REQUEST = re.compile(
@@ -687,7 +719,7 @@ def enforce(route, source):
     if source == "voice" and silent and route["intent"] != "ignore" and not (dos & {"maximize", "online"}):
         return {**route, "intent": "ignore", "actions": [], "reply": ""}
     if not online:
-        route["actions"] = [a for a in route["actions"] if a.get("do") in ("online", "maximize", "minimize", "mode")]
+        route["actions"] = [a for a in route["actions"] if a.get("do") in ("online", "maximize", "minimize", "mode", "close")]
         if route["intent"] == "chat" or (route["intent"] == "command" and not route["actions"] and not route["reply"]):
             return {**route, "intent": "command", "actions": [], "reply": random.choice(OFFLINE_LINES)}
     return route
@@ -697,7 +729,8 @@ def run_actions(acts):
     note = None
     for a in acts:
         d = a.get("do")
-        if d == "minimize": act_minimize(bool(a["mute"]) if "mute" in a else None)
+        if d == "close": close_jarvis()
+        elif d == "minimize": act_minimize(bool(a["mute"]) if "mute" in a else None)
         elif d == "maximize": act_maximize()
         elif d == "offline": online = False
         elif d == "online":
@@ -945,6 +978,9 @@ def handle(text, source):
     if source == "text":
         push_chat(new_id(), "you", text)
         set_state("processing")
+    if CLOSE_REQUEST.search(text):
+        close_jarvis()
+        return None
     output_request = OUTPUT_REQUEST.search(text)
     if output_request:
         mode = output_request.group("mode").lower()
@@ -1047,6 +1083,6 @@ if __name__ == "__main__":
     print("[Launching Pywebview UI...]")
     main_window = webview.create_window("Jarvis", "http://localhost:3000", frameless=True,
                                         width=BIG_W, height=BIG_H, on_top=True,
-                                        x=0, y=0)
+                                        x=WORK_X, y=WORK_Y)
     main_window.events.loaded += on_loaded
     webview.start(gui="edgechromium")

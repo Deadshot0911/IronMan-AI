@@ -18,6 +18,7 @@ LOG_FILE = os.path.join(BASE, "sentinel_log.txt")
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4000
 WAKE_WORDS = ("jarvis", "jervis", "service")
+WAKE_COOLDOWN_SECONDS = 6
 BACKEND_ADDRESS = ("127.0.0.1", 8000)
 MUTEX_NAME = "Local\\IronManAISentinel"
 CREATE_NO_WINDOW = 0x08000000
@@ -83,10 +84,10 @@ def wake_word_heard(model):
                 result = json.loads(recognizer.Result())
                 text = result.get("text", "").lower()
             else:
-                result = json.loads(recognizer.PartialResult())
-                text = result.get("partial", "").lower()
+                continue
 
-            if any(word in text.split() for word in WAKE_WORDS):
+            words = text.split()
+            if "[unk]" not in words and any(word in words for word in WAKE_WORDS):
                 log(f"Wake word detected: {text}")
                 return True
     return False
@@ -111,6 +112,7 @@ def launch_jarvis():
             while jarvis_is_running():
                 time.sleep(2)
             log("Jarvis stopped. Wake listener is active again.")
+            time.sleep(WAKE_COOLDOWN_SECONDS)
             return
         if process.poll() is not None:
             log(f"Jarvis launcher exited with code {process.returncode} before the backend started.")

@@ -3,7 +3,7 @@
 import { useState, useRef, useMemo, useEffect } from "react";
 import type { ReactNode, CSSProperties } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Mic, MicOff, MessageSquare, History, Cpu, Minimize2, Maximize2, SendHorizontal } from "lucide-react";
+import { Mic, MicOff, MessageSquare, History, Cpu, Minimize2, Maximize2, SendHorizontal, X } from "lucide-react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import "./jarvis-glass.css";
@@ -333,7 +333,6 @@ export default function JarvisUI() {
   const [memoryOn, setMemoryOn] = useState(false);
   const [engine, setEngine] = useState({ mode: "Auto", name: "Auto", model: "" });
   const [showEngine, setShowEngine] = useState(false);
-  const [miniHover, setMiniHover] = useState(false);
   const [hoveredButton, setHoveredButton] = useState<string | null>(null);
   const [vp, setVp] = useState({ w: 1280, h: 800 });
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -434,6 +433,7 @@ export default function JarvisUI() {
       setHoveredButton(null);
     }
   };
+  const closeJarvis = () => act({ action: "ui", do: "close" });
   const setMode = (text: boolean) => {
     setIsTextMode(text);
     act({ action: "set_mode", text });
@@ -549,6 +549,11 @@ export default function JarvisUI() {
     background: "radial-gradient(circle at 30% 22%, rgba(255,255,255,0.2), rgba(255,255,255,0.04) 45%, rgba(0,0,0,0.55) 100%)",
     boxShadow: "inset 0 2px 5px rgba(255,255,255,0.18), inset 0 -6px 12px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.12), 0 8px 18px rgba(0,0,0,0.8)",
     padding: 0,
+  };
+  const closeBtn: CSSProperties = {
+    ...glassBtn,
+    right: 92,
+    color: "#ff9aaa",
   };
 
   const slabW = isMinimized ? 200 : "100vw";
@@ -689,8 +694,6 @@ export default function JarvisUI() {
         whileHover={isMinimized ? { scale: miniScale * 1.12 } : undefined}
         transition={{ duration: dur, ease }}
         onClick={() => isMinimized && wake()}
-        onHoverStart={() => setMiniHover(true)}
-        onHoverEnd={() => setMiniHover(false)}
         style={{
           position: "relative",
           width: S,
@@ -946,6 +949,23 @@ export default function JarvisUI() {
           </motion.button>
         )}
       </AnimatePresence>
+      <AnimatePresence>
+        {!isMinimized && (
+          <motion.button
+            key="close-btn"
+            initial={{ opacity: 0, scale: 0.6 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.6 }}
+            whileHover={{ scale: 1.1 }}
+            onClick={closeJarvis}
+            style={closeBtn}
+            aria-label="Close Jarvis"
+            title="Close Jarvis"
+          >
+            <X size={20} />
+          </motion.button>
+        )}
+      </AnimatePresence>
 
       <div
         style={{
@@ -967,17 +987,43 @@ export default function JarvisUI() {
           transition: "opacity 0.5s ease",
           transitionDelay: isMinimized ? "0.5s" : "0s",
         }}
-      >
-        <Maximize2
-          size={26}
-          style={{
-            color: "#bff9ff",
-            filter: "drop-shadow(0 0 8px #22e5ff)",
-            opacity: isMinimized && miniHover ? 1 : 0,
-            transition: "opacity 0.3s",
-          }}
-        />
-      </div>
+      />
+
+      <AnimatePresence>
+        {isMinimized && (
+          <motion.div
+            key="mini-window-controls"
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            style={{
+              position: "fixed",
+              left: "calc(50% - 38px)",
+              top: `calc(50% - ${MINI / 2}px + 12px)`,
+              display: "flex",
+              gap: 8,
+              zIndex: 110,
+            }}
+          >
+            <button
+              onClick={wake}
+              aria-label="Maximize Jarvis"
+              title="Maximize Jarvis"
+              style={{ ...glassBtn, position: "static", width: 34, height: 34, background: "rgba(3,18,26,0.9)" }}
+            >
+              <Maximize2 size={16} />
+            </button>
+            <button
+              onClick={closeJarvis}
+              aria-label="Close Jarvis"
+              title="Close Jarvis"
+              style={{ ...closeBtn, position: "static", width: 34, height: 34, background: "rgba(24,7,13,0.92)" }}
+            >
+              <X size={16} />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {isTextMode && !isMinimized && (
