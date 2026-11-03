@@ -7,7 +7,12 @@
     targetX: 0,
     targetY: 0,
   };
-  const state = { minimized: Boolean(window.__jarvisMinimized), active: false, pinching: false };
+  const state = {
+    minimized: Boolean(window.__jarvisMinimized),
+    authenticated: Boolean(window.__jarvisAuthenticated),
+    active: false,
+    pinching: false,
+  };
   let video = null;
   let hands = null;
   let stream = null;
@@ -237,7 +242,7 @@
   }
 
   function startCamera() {
-    if (state.active || state.minimized || document.hidden) return;
+    if (state.active || !state.authenticated || state.minimized || document.hidden) return;
     if (typeof window.Hands !== "function") {
       scriptWaits += 1;
       if (scriptWaits >= 24) {
@@ -307,17 +312,26 @@
     else startCamera();
   }
 
+  function updateAuthState(event) {
+    const detail = event && event.detail;
+    state.authenticated = Boolean(detail && detail.user && !detail.required && !detail.gender_required);
+    if (state.authenticated) startCamera();
+    else stopCamera("HAND TRACKING · SIGN IN TO ENABLE");
+  }
+
   window.addEventListener("jarvisCameraPermissionReady", function () {
-    if (state.minimized || document.hidden) return;
+    if (!state.authenticated || state.minimized || document.hidden) return;
     if (state.active) stopCamera("RETRYING CAMERA ACCESS");
     startCamera();
   });
+  window.addEventListener("jarvisAuth", updateAuthState);
   window.addEventListener("jarvisState", updateWindowState);
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) stopCamera("HAND TRACKING · UI NOT VISIBLE");
     else if (!state.minimized) startCamera();
   });
 
-  if (state.minimized) report("OFF", "HAND TRACKING · MAXIMIZE TO ENABLE");
+  if (!state.authenticated) report("OFF", "HAND TRACKING · SIGN IN TO ENABLE");
+  else if (state.minimized) report("OFF", "HAND TRACKING · MAXIMIZE TO ENABLE");
   else startCamera();
 })();

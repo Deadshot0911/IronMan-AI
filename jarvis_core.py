@@ -1,6 +1,7 @@
 import asyncio, os, sys, time, json, threading, queue, re, io, random, collections, ctypes, subprocess
 from ctypes import wintypes
 from datetime import datetime
+from jarvis_auth import AuthStore, AuthenticationError, DEFAULT_ADMIN_NAME
 try:
     import numpy as np
     import sounddevice as sd
@@ -9,7 +10,6 @@ try:
     import websockets
     import webview
     from dotenv import load_dotenv
-    from kokoro import KPipeline
     from google import genai
     from google.genai import types
     from groq import Groq
@@ -62,8 +62,9 @@ except Exception:
 SMALL = 200
 BIG_W, BIG_H = SW, SH
 
-print("[Loading Local Kokoro TTS...]")
-kokoro_pipeline = KPipeline(lang_code="b")
+kokoro_pipeline = None
+kokoro_lock = threading.Lock()
+kokoro_warm_started = False
 
 PERSONA = (
     "You are J.A.R.V.I.S., talking with your user like a sharp, warm friend who happens to be a genius. "
@@ -106,6 +107,20 @@ win_lock = threading.Lock()
 noise, echo_g, barge_boost = 0.004, 0.6, 1.0
 chat_seq = 0
 chat_log = collections.OrderedDict()
+auth_store = None
+active_user = None
+active_session_id = None
+auth_mode = "login"
+auth_username = None
+auth_error = ""
+auth_management = None
+auth_prompt_queue = queue.Queue()
+auth_lock = threading.RLock()
+auth_ready = threading.Event()
+ui_loaded = threading.Event()
+audio_ready = False
+auth_epoch = 0
+turn_context = threading.local()
 
 def new_id():
     global chat_seq
@@ -117,20 +132,158 @@ memory_on = False
 stored, recent = [], []
 
 def disk_write():
+    if not auth_store or not active_user:
+        return
     try:
-        with open(MEM_FILE, "w", encoding="utf-8") as f:
-            json.dump({"on": memory_on, "history": stored[-200:]}, f, ensure_ascii=False)
+        auth_store.save_profile(
+            active_user["id"],
+            memory_on,
+            json.dumps(stored[-200:], ensure_ascii=False),
+        )
     except Exception as e:
         print(f"[Memory save error: {e}]")
 
-def disk_load():
-    global memory_on
-    try:
-        with open(MEM_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-        memory_on = bool(d.get("on")); stored[:] = d.get("history", [])
-    except Exception:
-        pass
+def auth_message_dict(error=None, history=None):
+    with auth_lock:
+        return {
+            "action": "auth",
+            "required": active_user is None,
+            "setup": bool(auth_store and not auth_store.has_admin()),
+            "mode": auth_mode,
+            "admin_name": DEFAULT_ADMIN_NAME,
+            "login_username": auth_username,
+            "gender_required": bool(active_user and not active_user.get("gender")),
+            "user": dict(active_user) if active_user else None,
+            "management": dict(auth_management) if auth_management else None,
+            "users": auth_store.list_users() if active_user and active_user["role"] == "admin" else [],
+            "error": error if error is not None else auth_error,
+            "history": history,
+        }
+
+def auth_message(error=None, history=None):
+    payload = auth_message_dict(error, history)
+    _broadcast(json.dumps(payload))
+
+def set_login_username(value):
+    global auth_username, auth_mode, auth_error
+    username = re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+    if not username or len(username) > 60:
+        raise AuthenticationError("Enter a username between 1 and 60 characters.")
+    if any(ord(char) < 32 for char in username):
+        raise AuthenticationError("The username contains unsupported characters.")
+    with auth_lock:
+        if active_user:
+            raise AuthenticationError("End the current session before signing in.")
+        auth_username = username
+        auth_mode = "pin"
+        auth_error = ""
+        if MIC is not None:
+            MIC.set_muted(True)
+    auth_message()
+    set_state("standby")
+
+def set_add_user_username(value):
+    global auth_management, auth_error
+    username = re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+    if not username or len(username) > 60:
+        raise AuthenticationError("Enter a username between 1 and 60 characters.")
+    if any(ord(char) < 32 for char in username):
+        raise AuthenticationError("The username contains unsupported characters.")
+    with auth_lock:
+        if not active_user or active_user["role"] != "admin":
+            raise AuthenticationError("Only the signed-in administrator can add users.")
+        if not auth_management or auth_management.get("mode") != "add_user":
+            raise AuthenticationError("There is no new-user form open.")
+        auth_management = {"mode": "add_user", "step": "pin", "username": username}
+        auth_error = ""
+        if MIC is not None:
+            MIC.set_muted(True)
+    auth_message()
+    set_state("standby")
+
+def activate_user(user):
+    global active_user, active_session_id, memory_on, chat_seq, auth_epoch
+    global auth_error, auth_management, auth_username, auth_mode
+    with auth_lock:
+        history = auth_store.recent_messages(user["id"])
+        memory_on, saved_memory = auth_store.load_profile(user["id"])
+        loaded_memory = json.loads(saved_memory)
+        if not isinstance(loaded_memory, list):
+            raise ValueError("Saved user memory must be a list.")
+        active_user = user
+        active_session_id = auth_store.start_session(user["id"])
+        stored[:] = loaded_memory[-200:]
+        recent[:] = [
+            {
+                "role": "user" if item["from"] == "you" else "assistant",
+                "content": item["text"],
+            }
+            for item in history[-6:]
+        ]
+        chat_log.clear()
+        for item in history:
+            try:
+                chat_seq = max(chat_seq, int(item["id"]))
+            except (TypeError, ValueError):
+                pass
+            chat_log[item["id"]] = (item["from"], item["text"])
+        while len(chat_log) > 60:
+            chat_log.popitem(last=False)
+        auth_management = None
+        auth_username = None
+        auth_mode = "login" if user.get("gender") else "gender_setup"
+        auth_error = ""
+        auth_epoch += 1
+        if MIC is not None:
+            MIC.set_muted(not bool(user.get("gender")) or silent)
+        if user.get("gender"):
+            auth_ready.set()
+        else:
+            auth_prompt_queue.put(
+                "How should I greet you? Choose a gender option or prefer not to say in the window."
+            )
+    auth_message(history=history)
+    push_state()
+
+def end_user_session(next_mode="login", error=""):
+    global active_user, active_session_id, auth_mode, auth_username, auth_error, auth_management, auth_epoch, memory_on, silent
+    with auth_lock:
+        auth_ready.clear()
+        auth_epoch += 1
+        if SPK is not None:
+            SPK.stop_now()
+        silent = False
+        if MIC is not None:
+            MIC.set_muted(next_mode == "admin_takeover")
+        if active_user and active_session_id is not None:
+            disk_write()
+            auth_store.end_session(active_session_id)
+        active_user = None
+        active_session_id = None
+        memory_on = False
+        auth_mode = next_mode
+        auth_username = DEFAULT_ADMIN_NAME if next_mode == "admin_takeover" else None
+        auth_error = error
+        auth_management = None
+        while not auth_prompt_queue.empty():
+            try:
+                auth_prompt_queue.get_nowait()
+            except queue.Empty:
+                break
+        recent.clear()
+        stored.clear()
+        chat_log.clear()
+        while not text_queue.empty():
+            try:
+                text_queue.get_nowait()
+            except queue.Empty:
+                break
+        set_state("standby")
+    auth_message()
+    if next_mode == "login":
+        auth_prompt_queue.put("Who's using Jarvis? Say your username, or type it on screen.")
+    elif next_mode == "admin_takeover":
+        auth_prompt_queue.put("Admin control requested. Enter the administrator PIN in the window.")
 
 def set_memory(on):
     global memory_on
@@ -152,6 +305,8 @@ def _broadcast(msg):
 def state_msg():
     return json.dumps({"action": "state", "state": state, "mini": ui_mini, "silent": silent, "online": online,
                        "memory": memory_on, "text_mode": text_mode, "output": output_pref,
+                       "user": active_user["username"] if active_user else None,
+                       "role": active_user["role"] if active_user else None,
                        "engine": {"mode": forced_engine, "name": active["name"], "model": active["model"]}})
 
 def push_state(): _broadcast(state_msg())
@@ -167,8 +322,19 @@ def set_active(name, model):
     active["name"], active["model"] = name, model; push_state()
 
 def push_chat(mid, who, text):
+    turn_epoch = getattr(turn_context, "epoch", None)
+    if turn_epoch is not None and turn_epoch != auth_epoch:
+        return
     chat_log[mid] = (who, text)
     while len(chat_log) > 60: chat_log.popitem(last=False)
+    if active_user and active_session_id is not None:
+        auth_store.save_message(
+            active_user["id"],
+            active_session_id,
+            mid,
+            "user" if who == "you" else "assistant",
+            text,
+        )
     _broadcast(json.dumps({"action": "chat", "id": mid, "from": who, "text": text}))
 
 def set_text_mode(on):
@@ -185,16 +351,143 @@ def set_output_preference(mode):
     push_state()
     return True
 
+def handle_auth_action(data):
+    global auth_error, auth_mode, auth_management, auth_username, active_user
+    action = data.get("do")
+    try:
+        if action == "bootstrap":
+            if active_user or auth_store.has_admin():
+                raise AuthenticationError("Administrator setup is already complete.")
+            user = auth_store.bootstrap_admin(data.get("pin", ""))
+            activate_user(user)
+        elif action == "username":
+            set_login_username(data.get("username", ""))
+        elif action == "username_reset":
+            with auth_lock:
+                if active_user or auth_mode == "admin_takeover":
+                    raise AuthenticationError("This sign-in step cannot be changed.")
+                auth_username = None
+                auth_mode = "login"
+                auth_error = ""
+                if MIC is not None:
+                    MIC.set_muted(False)
+            auth_message()
+        elif action == "login":
+            if active_user:
+                raise AuthenticationError("End the current session before signing in again.")
+            with auth_lock:
+                username = auth_username
+                require_admin = auth_mode == "admin_takeover" or (
+                    auth_mode == "pin"
+                    and isinstance(username, str)
+                    and username.casefold() == DEFAULT_ADMIN_NAME.casefold()
+                )
+            user = auth_store.authenticate(
+                username or "",
+                data.get("pin", ""),
+                require_admin=require_admin,
+            )
+            activate_user(user)
+        elif action == "set_gender":
+            if not active_user:
+                raise AuthenticationError("Sign in before setting a profile.")
+            auth_store.set_gender(active_user["id"], data.get("gender"))
+            active_user = auth_store.get_user(active_user["id"])
+            while not auth_prompt_queue.empty():
+                try:
+                    auth_prompt_queue.get_nowait()
+                except queue.Empty:
+                    break
+            with auth_lock:
+                auth_mode = "login"
+                auth_error = ""
+                if MIC is not None:
+                    MIC.set_muted(silent)
+                auth_ready.set()
+            auth_message()
+            push_state()
+        elif action == "logout":
+            if active_user is None:
+                raise AuthenticationError("There is no signed-in session.")
+            end_user_session()
+        elif action == "open_add_user":
+            if not active_user or active_user["role"] != "admin":
+                raise AuthenticationError("Only the signed-in administrator can add users.")
+            name = data.get("username", "")
+            with auth_lock:
+                auth_management = {
+                    "mode": "add_user",
+                    "step": "pin" if name.strip() else "username",
+                    "username": name[:60],
+                }
+                auth_error = ""
+            auth_message()
+            if name.strip():
+                auth_prompt_queue.put(
+                    f"I heard {name.strip()}. Enter and confirm the new PIN in the window."
+                )
+            else:
+                auth_prompt_queue.put("What's the new user's name? Say it, or type it in the window.")
+        elif action == "set_add_username":
+            set_add_user_username(data.get("username", ""))
+        elif action == "add_user":
+            if not active_user or active_user["role"] != "admin":
+                raise AuthenticationError("Only the signed-in administrator can add users.")
+            user = auth_store.add_user(
+                active_user["id"],
+                (auth_management or {}).get("username") or data.get("username", ""),
+                data.get("pin", ""),
+            )
+            with auth_lock:
+                auth_management = None
+                auth_error = f"{user['username']} was added."
+                if MIC is not None:
+                    MIC.set_muted(silent)
+            auth_message()
+        elif action == "open_delete_user":
+            if not active_user or active_user["role"] != "admin":
+                raise AuthenticationError("Only the signed-in administrator can manage users.")
+            with auth_lock:
+                auth_management = {"mode": "delete_user"}
+                auth_error = ""
+            auth_message()
+        elif action == "delete_user":
+            if not active_user or active_user["role"] != "admin":
+                raise AuthenticationError("Only the signed-in administrator can manage users.")
+            auth_store.disable_user(active_user["id"], int(data.get("user_id")))
+            with auth_lock:
+                auth_management = None
+                auth_error = "The user was disabled. Their saved history was retained."
+            auth_message()
+        elif action == "close_management":
+            with auth_lock:
+                auth_management = None
+                auth_error = ""
+                if MIC is not None:
+                    MIC.set_muted(silent)
+            auth_message()
+        else:
+            raise AuthenticationError("That account action is not supported.")
+    except (AuthenticationError, TypeError, ValueError) as error:
+        with auth_lock:
+            auth_error = str(error)
+        auth_message()
+
 async def ws_handler(websocket):
     connected_clients.add(websocket)
     await websocket.send(state_msg())
+    await websocket.send(json.dumps(auth_message_dict()))
     for mid, (who, text) in list(chat_log.items()):          
         await websocket.send(json.dumps({"action": "chat", "id": mid, "from": who, "text": text}))
     try:
         async for message in websocket:
             try:
                 d = json.loads(message); a = d.get("action")
-                if a == "command":
+                if a == "auth":
+                    handle_auth_action(d)
+                elif not active_user:
+                    continue
+                elif a == "command":
                     text = d.get("text", "")
                     if CLOSE_REQUEST.search(text):
                         close_jarvis()
@@ -227,7 +520,9 @@ def start_ws_server():
 
 def heartbeat():
     while True:
-        time.sleep(1.5); push_state()
+        time.sleep(1.5)
+        push_state()
+        auth_message()
 
 # ---------- WINDOW ----------
 def glide(x2, y2, ms=350, steps=18):
@@ -394,7 +689,25 @@ MIC = SPK = None
 
 def init_audio():
     global MIC, SPK
-    SPK = Speaker(); MIC = Mic(); MIC.set_muted(silent)
+    speaker = None
+    microphone = None
+    try:
+        speaker = Speaker()
+        microphone = Mic()
+        microphone.set_muted(silent)
+    except Exception:
+        for stream in (
+            getattr(microphone, "stream", None),
+            getattr(speaker, "stream", None),
+        ):
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception as cleanup_error:
+                    print(f"[Audio cleanup error: {cleanup_error}]")
+        raise
+    SPK, MIC = speaker, microphone
 
 def calibrate_noise():
     global noise
@@ -431,13 +744,24 @@ def transcribe(audio):
     except Exception as e:
         print(f"[STT error: {e}]"); return None
 
-def listen_fast():
+def listen_fast(allow_unauthenticated=False):
     global noise
     set_state(ready_state())
     ring, pre = collections.deque(maxlen=8), collections.deque(maxlen=10)
     frames, trig, quiet, voiced_n, t0 = [], False, 0, 0, time.time()
     muted = False
     while True:
+        if not auth_prompt_queue.empty():
+            set_state("standby")
+            return None
+        if allow_unauthenticated and (auth_mode != "login" or auth_username is not None):
+            set_state("standby")
+            return None
+        if auth_ready.is_set() and auth_management and auth_management.get("mode") == "add_user" and auth_management.get("step") != "username":
+            set_state("standby")
+            return None
+        if not auth_ready.is_set() and not allow_unauthenticated:
+            return None
         if not text_queue.empty(): return None
         if silent:
             if not muted:
@@ -670,6 +994,19 @@ CLOSE_REQUEST = re.compile(
     r"(?:jarvis|yourself|the app|the application|the ui|this app|the window|this window)\b",
     re.IGNORECASE,
 )
+ADMIN_TAKEOVER_REQUEST = re.compile(
+    r"\b(?:jarvis[\s,:-]+)?admin[\s,:-]+taking[\s,:-]+control\b|"
+    r"\badmin[\s,:-]+take[\s,:-]+control\b",
+    re.IGNORECASE,
+)
+ADD_USER_REQUEST = re.compile(
+    r"\badd\s+(?:a\s+)?new\s+user(?:\s+(?:named|called)\s+([^.!?]+))?",
+    re.IGNORECASE,
+)
+DELETE_USER_REQUEST = re.compile(
+    r"\b(?:delete|remove|disable)\s+(?:the\s+)?user(?:\s+(.+?))?[.!?]*$",
+    re.IGNORECASE,
+)
 DEEP_REQUEST = re.compile(
     r"\b(?:in depth|deep dive|comprehensive|thorough|step by step|research)\b",
     re.IGNORECASE,
@@ -769,6 +1106,38 @@ def windows_speech_fallback(text):
         input=text, capture_output=True, text=True, timeout=90, check=True,
     )
 
+def get_kokoro_pipeline():
+    global kokoro_pipeline
+    if kokoro_pipeline is None:
+        with kokoro_lock:
+            if kokoro_pipeline is None:
+                from kokoro import KPipeline
+                kokoro_pipeline = KPipeline(lang_code="b")
+    return kokoro_pipeline
+
+def warm_kokoro():
+    global kokoro_warm_started
+    with auth_lock:
+        if kokoro_warm_started:
+            return
+        kokoro_warm_started = True
+    try:
+        get_kokoro_pipeline()
+        print("[TTS model is ready.]")
+    except Exception as error:
+        print(f"[TTS warmup error: {error}]")
+
+def speak_auth_prompt(text):
+    set_state("speaking")
+    try:
+        windows_speech_fallback(text)
+    except Exception as error:
+        print(f"[Authentication voice prompt error: {error}]")
+    finally:
+        if MIC is not None:
+            MIC.flush()
+        set_state("listening" if MIC is not None and not MIC.muted and not silent else "standby")
+
 def typed_waiting(): return not text_queue.empty()
 
 def valid_barge(text, said):
@@ -841,7 +1210,7 @@ def speak_stream(sent_iter, said, mid):
                 push_chat(mid, "jarvis", " ".join(said))
                 try:
                     produced_audio = False
-                    for _, _, a in kokoro_pipeline(sent, voice=VOICE, speed=1.08):
+                    for _, _, a in get_kokoro_pipeline()(sent, voice=VOICE, speed=1.08):
                         if stop.is_set(): break
                         audio = to_np(a)
                         if audio.size:
@@ -948,9 +1317,12 @@ def say(text):
 def greet():
     h = datetime.now().hour
     tod = "morning" if h < 12 else "afternoon" if h < 17 else "evening"
-    return random.choice([f"Good {tod}, Sir. Everything's up and running.",
-                          f"Ah, good {tod}. I'm all ears.",
-                          f"Systems are up. Good {tod}, Sir. What are we working on?"])
+    username = active_user["username"] if active_user else "there"
+    gender = active_user.get("gender") if active_user else None
+    title = "Sir" if gender == "male" else "Ma'am" if gender == "female" else username
+    return random.choice([f"Good {tod}, {title}. Everything's up and running.",
+                          f"Ah, good {tod}, {title}. I'm all ears.",
+                          f"Systems are up. Good {tod}, {title}. What are we working on?"])
 
 def chat(text, source, route):
     voice = want_voice(source, route["speak"])
@@ -973,11 +1345,47 @@ def chat(text, source, route):
     return barge
 
 def handle(text, source):
+    global auth_management, auth_error
     if source == "voice" and (silent or not online) and len(text.split()) > 15:
         set_state(ready_state()); return None
     if source == "text":
         push_chat(new_id(), "you", text)
         set_state("processing")
+    takeover = ADMIN_TAKEOVER_REQUEST.search(text)
+    if takeover:
+        if source == "voice":
+            push_chat(new_id(), "you", text)
+        end_user_session("admin_takeover")
+        if mini:
+            act_maximize()
+        auth_message()
+        return None
+    add_user = ADD_USER_REQUEST.search(text)
+    if add_user:
+        if not active_user or active_user["role"] != "admin":
+            return reply_text("Only the administrator can add users.", source)
+        if source == "voice":
+            push_chat(new_id(), "you", text)
+        with auth_lock:
+            auth_management = {
+                "mode": "add_user",
+                "step": "username",
+                "username": (add_user.group(1) or "").strip()[:60],
+            }
+            auth_error = ""
+        auth_message()
+        return reply_text("What's the new user's name? Say it, or type it in the window.", source)
+    delete_user = DELETE_USER_REQUEST.search(text)
+    if delete_user:
+        if not active_user or active_user["role"] != "admin":
+            return reply_text("Only the administrator can manage users.", source)
+        if source == "voice":
+            push_chat(new_id(), "you", text)
+        with auth_lock:
+            auth_management = {"mode": "delete_user"}
+            auth_error = ""
+        auth_message()
+        return reply_text("Choose the account to disable.", source)
     if CLOSE_REQUEST.search(text):
         close_jarvis()
         return None
@@ -1014,27 +1422,129 @@ def handle(text, source):
     return chat(text, source, route)
 
 def jarvis_brain():
-    time.sleep(1.5)
-    try:
-        init_audio()
-    except Exception as e:
-        print(f"[Audio device error: {e}]"); return
-    calibrate_noise()
-    set_state("listening" if online and not silent else "standby")
-    threading.Thread(target=discover_gemini, daemon=True).start()
-    pending = say(greet()) if online and not silent else None
+    global audio_ready, auth_error
+    last_audio_attempt = 0.0
+    greeting_pending = True
     while True:
-        if pending: text, src, pending = pending, "voice", None
-        elif not text_queue.empty(): text, src = text_queue.get()
-        else: text, src = listen_fast(), "voice"
-        if not text or not text.strip(): continue
-        try:
-            pending = handle(text.strip(), src)
-        except Exception as e:
-            print(f"[Handler error: {e}]"); set_state("listening" if online and not silent else "standby")
+        if not audio_ready and time.monotonic() - last_audio_attempt >= 3:
+            last_audio_attempt = time.monotonic()
+            try:
+                init_audio()
+                audio_ready = True
+                threading.Thread(target=discover_gemini, daemon=True).start()
+                auth_error = ""
+                auth_message()
+            except Exception as e:
+                print(f"[Audio device error: {e}]")
+                with auth_lock:
+                    auth_error = "Microphone unavailable. You can still sign in by typing; Jarvis will retry audio."
+                auth_message()
+
+        if not auth_ready.wait(0.1):
+            if not ui_loaded.is_set():
+                time.sleep(0.1)
+                continue
+            try:
+                prompt = auth_prompt_queue.get_nowait()
+            except queue.Empty:
+                prompt = None
+            if prompt:
+                speak_auth_prompt(prompt)
+                continue
+            if active_user:
+                time.sleep(0.1)
+                continue
+            if not audio_ready:
+                time.sleep(0.1)
+                continue
+            if auth_mode == "login" and auth_username is None:
+                text = listen_fast(allow_unauthenticated=True)
+                if text and not auth_ready.is_set():
+                    try:
+                        set_login_username(text)
+                        speak_auth_prompt(
+                            f"I heard {auth_username}. Enter the PIN in the Jarvis window."
+                        )
+                    except AuthenticationError as error:
+                        with auth_lock:
+                            auth_error = str(error)
+                        auth_message()
+                        auth_prompt_queue.put(
+                            "I didn't catch a valid username. Please say it again or type it."
+                        )
+            continue
+
+        threading.Thread(target=warm_kokoro, daemon=True).start()
+        if not ui_loaded.is_set():
+            ui_loaded.wait()
+        if greeting_pending and active_user:
+            speak_auth_prompt(greet())
+        greeting_pending = False
+        pending = None
+        while auth_ready.is_set():
+            if auth_management and auth_management.get("mode") == "add_user":
+                if auth_management.get("step") != "username":
+                    time.sleep(0.1)
+                    continue
+                try:
+                    prompt = auth_prompt_queue.get_nowait()
+                except queue.Empty:
+                    prompt = None
+                if prompt:
+                    speak_auth_prompt(prompt)
+                if MIC is None:
+                    time.sleep(0.1)
+                    continue
+                text = listen_fast()
+                if text and auth_ready.is_set():
+                    try:
+                        set_add_user_username(text)
+                        speak_auth_prompt(
+                            f"I heard {auth_management['username']}. Enter and confirm the new PIN in the window."
+                        )
+                    except AuthenticationError as error:
+                        with auth_lock:
+                            auth_error = str(error)
+                        auth_message()
+                continue
+            try:
+                prompt = auth_prompt_queue.get_nowait()
+            except queue.Empty:
+                prompt = None
+            if prompt:
+                speak_auth_prompt(prompt)
+                continue
+            if pending:
+                text, src, pending = pending, "voice", None
+            elif not text_queue.empty():
+                text, src = text_queue.get()
+            elif MIC is None:
+                time.sleep(0.1)
+                continue
+            else:
+                text, src = listen_fast(), "voice"
+            if not auth_ready.is_set():
+                break
+            if not text or not text.strip():
+                continue
+            turn_context.epoch = auth_epoch
+            try:
+                pending = handle(text.strip(), src)
+            except Exception as e:
+                print(f"[Handler error: {e}]")
+                set_state("listening" if online and not silent else "standby")
+            finally:
+                turn_context.epoch = None
+        if SPK is not None:
+            SPK.stop_now()
+        greeting_pending = True
 
 if __name__ == "__main__":
-    disk_load()
+    auth_store = AuthStore()
+    if auth_store.has_admin():
+        auth_prompt_queue.put(
+            "Who's using Jarvis? Say your username, or type it on screen."
+        )
     threading.Thread(target=start_ws_server, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=jarvis_brain, daemon=True).start()
@@ -1071,14 +1581,20 @@ if __name__ == "__main__":
             const d = JSON.parse(e.data);
             if (d.action === 'state') window.dispatchEvent(new CustomEvent('jarvisState', { detail: d }));
             else if (d.action === 'chat') window.dispatchEvent(new CustomEvent('jarvisChat', { detail: d }));
+            else if (d.action === 'auth') {
+              window.__jarvisAuthenticated = Boolean(d.user && !d.required && !d.gender_required);
+              window.dispatchEvent(new CustomEvent('jarvisAuth', { detail: d }));
+            }
           };
         }
         connect();
         const out = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
         window.addEventListener('jarvisCommand', (ev) => out({ action: 'command', text: ev.detail }));
         window.addEventListener('jarvisAction', (ev) => out(ev.detail));
+        window.addEventListener('jarvisAuthAction', (ev) => out({ action: 'auth', ...ev.detail }));
         window.dispatchEvent(new Event('jarvisCameraPermissionReady'));
         """)
+        ui_loaded.set()
 
     print("[Launching Pywebview UI...]")
     main_window = webview.create_window("Jarvis", "http://localhost:3000", frameless=True,
@@ -1086,3 +1602,5 @@ if __name__ == "__main__":
                                         x=WORK_X, y=WORK_Y)
     main_window.events.loaded += on_loaded
     webview.start(gui="edgechromium")
+    if active_user:
+        end_user_session()

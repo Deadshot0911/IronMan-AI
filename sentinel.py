@@ -84,7 +84,8 @@ def wake_word_heard(model):
                 result = json.loads(recognizer.Result())
                 text = result.get("text", "").lower()
             else:
-                continue
+                partial = json.loads(recognizer.PartialResult())
+                text = partial.get("partial", "").lower()
 
             words = text.split()
             if "[unk]" not in words and any(word in words for word in WAKE_WORDS):

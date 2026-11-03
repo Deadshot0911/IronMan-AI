@@ -14,7 +14,21 @@ const VIOLET = "#8b5cff";
 const RED = "#ff5470";
 const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
-type Msg = { id: number; from: "jarvis" | "you"; text: string };
+type Msg = { id: number | string; from: "jarvis" | "you"; text: string };
+type AuthUser = { id: number; username: string; role: "admin" | "user"; gender?: string | null };
+type AuthState = {
+  ready: boolean;
+  required: boolean;
+  setup: boolean;
+  mode: string;
+  admin_name: string;
+  login_username?: string | null;
+  user: AuthUser | null;
+  management: { mode: string; step?: string; username?: string } | null;
+  users: AuthUser[];
+  error: string;
+  history?: Msg[] | null;
+};
 type ControlButton = {
   id: string;
   icon: ReactNode;
@@ -27,6 +41,440 @@ type ControlButton = {
   badgeOn?: boolean;
   redTint?: boolean;
 };
+
+function AuthScreen({ auth, send }: { auth: AuthState; send: (data: object) => void }) {
+  const [username, setUsername] = useState(
+    auth.setup || auth.mode === "admin_takeover" ? auth.admin_name : "",
+  );
+  const [pin, setPin] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
+  const isSetup = auth.setup;
+  const isTakeover = auth.mode === "admin_takeover";
+  const loginUsername = auth.login_username || (isTakeover ? auth.admin_name : "");
+  const pinStep = isSetup || isTakeover || Boolean(loginUsername);
+
+  const submit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!isSetup && !isTakeover && !pinStep) {
+      send({ do: "username", username: username.trim() });
+      return;
+    }
+    if (isSetup && pin !== confirmPin) return;
+    send({
+      do: isSetup ? "bootstrap" : "login",
+      pin,
+    });
+    setPin("");
+    setConfirmPin("");
+  };
+
+  return (
+    <main
+      style={{
+        position: "fixed",
+        inset: 0,
+        display: "grid",
+        placeItems: "center",
+        padding: 24,
+        color: "#d4fbff",
+        background: "radial-gradient(ellipse at 50% 45%, #0c202a 0%, #06111b 48%, #02060b 100%)",
+        fontFamily: MONO,
+      }}
+    >
+      <form
+        onSubmit={submit}
+        style={{
+          width: "min(400px, 100%)",
+          padding: 28,
+          borderRadius: 22,
+          background: "rgba(9,24,34,0.82)",
+          border: "1px solid rgba(34,229,255,0.34)",
+          boxShadow: "0 0 42px rgba(34,229,255,0.14), inset 0 1px rgba(255,255,255,0.1)",
+          backdropFilter: "blur(24px)",
+        }}
+      >
+        <div style={{ color: CYAN, fontSize: 10, letterSpacing: "0.3em" }}>J.A.R.V.I.S. · SECURE SESSION</div>
+        <h1 style={{ margin: "14px 0 8px", fontSize: 22, letterSpacing: "0.12em" }}>
+          {isSetup ? "INITIAL ADMIN SETUP" : isTakeover ? "ADMIN CONTROL" : "WHO'S THERE?"}
+        </h1>
+        <p style={{ margin: "0 0 22px", color: "rgba(190,239,255,0.66)", fontSize: 12, lineHeight: 1.6 }}>
+          {isSetup
+            ? `Create the ${auth.admin_name} administrator account. Choose a 4–8 digit PIN.`
+            : isTakeover
+            ? "The previous session has been saved. Enter the administrator PIN to take control."
+            : pinStep
+            ? "Enter your PIN in this private sign-in window."
+            : "Say your username, or type it below. Jarvis will ask for your PIN here."}
+        </p>
+        {!isSetup && !isTakeover && !pinStep && (
+          <label style={authLabel}>
+            USERNAME
+            <input
+              autoComplete="username"
+              autoFocus
+              placeholder="Say it or type your username"
+              maxLength={60}
+              required
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              style={authInput}
+            />
+          </label>
+        )}
+        {!isSetup && !isTakeover && pinStep && (
+          <div style={{ ...authInput, marginBottom: 14, display: "flex", justifyContent: "space-between" }}>
+            <span>{loginUsername}</span>
+            <button type="button" onClick={() => { setPin(""); send({ do: "username_reset" }); }} style={authBackButton}>
+              CHANGE
+            </button>
+          </div>
+        )}
+        {(isSetup || isTakeover) && (
+          <div style={{ ...authInput, marginBottom: 14, color: CYAN }}>
+            {auth.admin_name} · ADMIN
+          </div>
+        )}
+        {(pinStep || isSetup || isTakeover) && (
+          <>
+            <label style={authLabel}>
+              {isSetup ? "CREATE ADMIN PIN" : isTakeover || loginUsername.toLowerCase() === auth.admin_name.toLowerCase() ? "ADMIN PIN" : "PIN"}
+              <input
+                autoComplete={isSetup ? "new-password" : "current-password"}
+                autoFocus
+                inputMode="numeric"
+                maxLength={8}
+                minLength={4}
+                pattern="[0-9]{4,8}"
+                required
+                type="password"
+                value={pin}
+                onChange={(event) => setPin(event.target.value.replace(/\D/g, "").slice(0, 8))}
+                style={authInput}
+              />
+            </label>
+            {isSetup && (
+              <label style={authLabel}>
+                CONFIRM ADMIN PIN
+                <input
+                  autoComplete="new-password"
+                  inputMode="numeric"
+                  maxLength={8}
+                  minLength={4}
+                  pattern="[0-9]{4,8}"
+                  required
+                  type="password"
+                  value={confirmPin}
+                  onChange={(event) => setConfirmPin(event.target.value.replace(/\D/g, "").slice(0, 8))}
+                  style={authInput}
+                />
+              </label>
+            )}
+            {isSetup && confirmPin && pin !== confirmPin && (
+              <p role="alert" style={authErrorStyle}>The PINs do not match.</p>
+            )}
+          </>
+        )}
+        {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+        <button type="submit" style={authPrimaryButton}>
+          {isSetup ? "CREATE ADMIN ACCOUNT" : isTakeover ? "VERIFY ADMIN PIN" : pinStep ? "UNLOCK SESSION" : "CONFIRM USERNAME"}
+        </button>
+      </form>
+    </main>
+  );
+}
+
+function GenderSetup({ auth, send }: { auth: AuthState; send: (data: object) => void }) {
+  return (
+    <main
+      style={{
+        position: "fixed",
+        inset: 0,
+        display: "grid",
+        placeItems: "center",
+        padding: 24,
+        color: "#d4fbff",
+        background: "radial-gradient(ellipse at 50% 45%, #0c202a 0%, #06111b 48%, #02060b 100%)",
+        fontFamily: MONO,
+      }}
+    >
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="gender-setup-title"
+        style={{
+          width: "min(400px, 100%)",
+          padding: 28,
+          borderRadius: 22,
+          background: "rgba(9,24,34,0.82)",
+          border: "1px solid rgba(34,229,255,0.34)",
+          boxShadow: "0 0 42px rgba(34,229,255,0.14)",
+          backdropFilter: "blur(24px)",
+        }}
+      >
+        <div style={{ color: CYAN, fontSize: 10, letterSpacing: "0.3em" }}>J.A.R.V.I.S. · USER PROFILE</div>
+        <h1 id="gender-setup-title" style={{ margin: "14px 0 8px", fontSize: 20 }}>
+          HOW SHOULD I GREET YOU?
+        </h1>
+        <p style={{ margin: "0 0 20px", color: "rgba(190,239,255,0.66)", fontSize: 12, lineHeight: 1.6 }}>
+          This is saved to {auth.user?.username}&apos;s profile and only affects greetings.
+        </p>
+        <div style={{ display: "grid", gap: 9 }}>
+          {[
+            ["male", "Male · Sir"],
+            ["female", "Female · Ma’am"],
+            ["non_binary", "Non-binary · use my name"],
+            ["prefer_not_to_say", "Prefer not to say · use my name"],
+          ].map(([gender, label]) => (
+            <button
+              key={gender}
+              onClick={() => send({ do: "set_gender", gender })}
+              style={authSecondaryButton}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+      </section>
+    </main>
+  );
+}
+
+const authLabel: CSSProperties = {
+  display: "grid",
+  gap: 8,
+  marginBottom: 14,
+  color: "rgba(190,239,255,0.66)",
+  fontSize: 10,
+  letterSpacing: "0.18em",
+};
+const authInput: CSSProperties = {
+  width: "100%",
+  boxSizing: "border-box",
+  padding: "12px 13px",
+  color: "#e5fcff",
+  background: "rgba(0,0,0,0.28)",
+  border: "1px solid rgba(34,229,255,0.24)",
+  borderRadius: 10,
+  outline: "none",
+  font: `14px ${MONO}`,
+};
+const authErrorStyle: CSSProperties = {
+  margin: "2px 0 14px",
+  color: "#ff9aaa",
+  fontSize: 12,
+  lineHeight: 1.5,
+};
+const authPrimaryButton: CSSProperties = {
+  width: "100%",
+  marginTop: 6,
+  padding: "13px 16px",
+  border: "1px solid rgba(34,229,255,0.44)",
+  borderRadius: 10,
+  color: "#dffcff",
+  background: "rgba(34,229,255,0.12)",
+  font: `11px ${MONO}`,
+  letterSpacing: "0.16em",
+  cursor: "pointer",
+};
+const authBackButton: CSSProperties = {
+  border: "none",
+  padding: 0,
+  color: CYAN,
+  background: "transparent",
+  font: `9px ${MONO}`,
+  letterSpacing: "0.12em",
+  cursor: "pointer",
+};
+const authSecondaryButton: CSSProperties = {
+  padding: "10px 12px",
+  border: "1px solid rgba(34,229,255,0.2)",
+  borderRadius: 9,
+  color: "#c9f8ff",
+  background: "rgba(255,255,255,0.04)",
+  font: `10px ${MONO}`,
+  letterSpacing: "0.12em",
+  cursor: "pointer",
+};
+const authDangerButton: CSSProperties = {
+  ...authSecondaryButton,
+  flex: 1,
+  borderColor: "rgba(255,84,112,0.5)",
+  color: "#ff9aaa",
+};
+
+function UserManagementDialog({
+  auth,
+  send,
+}: {
+  auth: AuthState;
+  send: (data: object) => void;
+}) {
+  const [username, setUsername] = useState(auth.management?.username || "");
+  const [pin, setPin] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [target, setTarget] = useState<AuthUser | null>(null);
+
+  if (!auth.management) return null;
+  const adding = auth.management.mode === "add_user";
+  const usernameStep = adding && auth.management.step !== "pin";
+
+  const addUser = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (usernameStep) {
+      send({ do: "set_add_username", username: username.trim() });
+      return;
+    }
+    if (pin !== confirmation) {
+      setConfirmation("");
+      return;
+    }
+    send({ do: "add_user", username: username.trim(), pin });
+    setPin("");
+    setConfirmation("");
+  };
+
+  return (
+    <div
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) send({ do: "close_management" });
+      }}
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 300,
+        display: "grid",
+        placeItems: "center",
+        padding: 20,
+        background: "rgba(0,4,8,0.74)",
+        backdropFilter: "blur(12px)",
+        fontFamily: MONO,
+      }}
+    >
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="user-management-title"
+        style={{
+          width: "min(420px, 100%)",
+          padding: 24,
+          borderRadius: 18,
+          color: "#d4fbff",
+          background: "rgba(8,23,33,0.96)",
+          border: "1px solid rgba(34,229,255,0.34)",
+          boxShadow: "0 0 42px rgba(34,229,255,0.16)",
+        }}
+      >
+        <h2 id="user-management-title" style={{ margin: "0 0 8px", fontSize: 18 }}>
+          {adding ? "ADD A USER" : target ? "DISABLE ACCOUNT?" : "MANAGE USERS"}
+        </h2>
+        <p style={{ margin: "0 0 18px", color: "rgba(190,239,255,0.65)", fontSize: 12, lineHeight: 1.6 }}>
+          {adding
+            ? usernameStep
+              ? "Say the new user's name, or type it below. PINs are entered only here."
+              : "Choose and confirm a 4–8 digit PIN. Their conversation history will be separate."
+            : target
+            ? `${target.username}'s account will be disabled. Their saved history will be retained.`
+            : "Disabled accounts cannot sign in. Their saved history is retained."}
+        </p>
+        {adding ? (
+          <form onSubmit={addUser}>
+            {usernameStep ? (
+              <label style={authLabel}>
+                USERNAME
+                <input
+                  autoFocus
+                  autoComplete="off"
+                  maxLength={60}
+                  required
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  style={authInput}
+                />
+              </label>
+            ) : (
+              <div style={{ ...authInput, marginBottom: 14 }}>{auth.management.username}</div>
+            )}
+            {!usernameStep && (
+              <>
+                <label style={authLabel}>
+                  NEW USER PIN
+                  <input
+                    autoComplete="new-password"
+                    inputMode="numeric"
+                    maxLength={8}
+                    minLength={4}
+                    pattern="[0-9]{4,8}"
+                    required
+                    type="password"
+                    value={pin}
+                    onChange={(event) => setPin(event.target.value.replace(/\D/g, "").slice(0, 8))}
+                    style={authInput}
+                  />
+                </label>
+                <label style={authLabel}>
+                  CONFIRM PIN
+                  <input
+                    autoComplete="new-password"
+                    inputMode="numeric"
+                    maxLength={8}
+                    minLength={4}
+                    pattern="[0-9]{4,8}"
+                    required
+                    type="password"
+                    value={confirmation}
+                    onChange={(event) => setConfirmation(event.target.value.replace(/\D/g, "").slice(0, 8))}
+                    style={authInput}
+                  />
+                </label>
+                {confirmation && pin !== confirmation && (
+                  <p role="alert" style={authErrorStyle}>The PINs do not match.</p>
+                )}
+              </>
+            )}
+            {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+            <button type="submit" style={authPrimaryButton}>
+              {usernameStep ? "CONFIRM USERNAME" : "SAVE USER"}
+            </button>
+          </form>
+        ) : target ? (
+          <div style={{ display: "flex", gap: 10 }}>
+            <button onClick={() => setTarget(null)} style={authSecondaryButton}>CANCEL</button>
+            <button onClick={() => send({ do: "delete_user", user_id: target.id })} style={authDangerButton}>
+              DISABLE USER
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "grid", gap: 8, maxHeight: "42vh", overflowY: "auto" }}>
+            {auth.users.filter((user) => user.role === "user").map((user) => (
+              <button
+                key={user.id}
+                onClick={() => setTarget(user)}
+                style={authSecondaryButton}
+              >
+                DISABLE · {user.username}
+              </button>
+            ))}
+            {auth.users.every((user) => user.role !== "user") && (
+              <p style={{ color: "rgba(190,239,255,0.58)", fontSize: 12 }}>No regular accounts have been added.</p>
+            )}
+            {auth.error && <p role="status" style={{ color: CYAN, fontSize: 12 }}>{auth.error}</p>}
+          </div>
+        )}
+        {!adding && auth.error && !target && (
+          <p role="status" style={{ color: CYAN, fontSize: 12 }}>{auth.error}</p>
+        )}
+        <button
+          onClick={() => send({ do: "close_management" })}
+          style={{ ...authSecondaryButton, marginTop: 14 }}
+        >
+          CLOSE
+        </button>
+      </section>
+    </div>
+  );
+}
 
 declare global {
   interface Window {
@@ -323,6 +771,18 @@ function Bracket({ pos, color }: { pos: "tl" | "tr" | "bl" | "br"; color: string
 }
 
 export default function JarvisUI() {
+  const [auth, setAuth] = useState<AuthState>({
+    ready: false,
+    required: true,
+    setup: false,
+    mode: "login",
+    admin_name: "Sunrit",
+    login_username: null,
+    user: null,
+    management: null,
+    users: [],
+    error: "",
+  });
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -339,6 +799,20 @@ export default function JarvisUI() {
   const [input, setInput] = useState("");
   const [visionMessage, setVisionMessage] = useState("HAND TRACKING · MAXIMIZE TO ENABLE");
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<AuthState>).detail;
+      setAuth({ ...detail, ready: true });
+      if (detail.required) {
+        setMessages([]);
+      } else if (Array.isArray(detail.history)) {
+        setMessages(detail.history);
+      }
+    };
+    window.addEventListener("jarvisAuth", handler);
+    return () => window.removeEventListener("jarvisAuth", handler);
+  }, []);
 
   useEffect(() => {
     const update = () => setVp({ w: window.innerWidth, h: window.innerHeight });
@@ -418,6 +892,7 @@ export default function JarvisUI() {
   }, [messages, isProcessing]);
 
   const act = (o: object) => window.dispatchEvent(new CustomEvent("jarvisAction", { detail: o }));
+  const authSend = (data: object) => window.dispatchEvent(new CustomEvent("jarvisAuthAction", { detail: data }));
   const linked = () => !!window.__jarvisLinked;
   const wake = () => {
     window.__jarvisMinimized = false;
@@ -478,6 +953,7 @@ export default function JarvisUI() {
   const modelShort = (engine.model || "").replace("openai/", "");
   const dim = !isOnline || isSilent;
   const lastIsYou = messages.length > 0 && messages[messages.length - 1].from === "you";
+  const canManageUsers = auth.user?.role === "admin";
 
   const compact = vp.w < 320;
   const S = compact ? vp.w - 30 : Math.max(320, Math.min(vp.w, vp.h));
@@ -559,7 +1035,15 @@ export default function JarvisUI() {
   const slabW = isMinimized ? 200 : "100vw";
   const slabH = isMinimized ? 200 : "100vh";
 
+  if (!auth.ready || auth.required || !auth.user) {
+    return <AuthScreen key={`${auth.mode}-${auth.setup}`} auth={auth} send={authSend} />;
+  }
+  if (!auth.user.gender) {
+    return <GenderSetup auth={auth} send={authSend} />;
+  }
+
   return (
+    <>
     <div
       style={{
         position: "fixed",
@@ -949,6 +1433,35 @@ export default function JarvisUI() {
           </motion.button>
         )}
       </AnimatePresence>
+      <div
+        style={{
+          position: "fixed",
+          top: 34,
+          left: 28,
+          zIndex: 100,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          fontFamily: MONO,
+        }}
+      >
+        <span style={{ color: CYAN, fontSize: 10, letterSpacing: "0.12em" }}>
+          {auth.user.username.toUpperCase()} · {auth.user.role.toUpperCase()}
+        </span>
+        {canManageUsers && (
+          <>
+            <button onClick={() => authSend({ do: "open_add_user" })} style={authSecondaryButton}>
+              ADD USER
+            </button>
+            <button onClick={() => authSend({ do: "open_delete_user" })} style={authSecondaryButton}>
+              USERS
+            </button>
+          </>
+        )}
+        <button onClick={() => authSend({ do: "logout" })} style={authSecondaryButton}>
+          END SESSION
+        </button>
+      </div>
       <AnimatePresence>
         {!isMinimized && (
           <motion.button
@@ -1131,5 +1644,11 @@ export default function JarvisUI() {
         )}
       </AnimatePresence>
     </div>
+    <UserManagementDialog
+      key={`${auth.management?.mode || ""}-${auth.management?.username || ""}`}
+      auth={auth}
+      send={authSend}
+    />
+    </>
   );
 }
