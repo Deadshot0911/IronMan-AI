@@ -1,7 +1,12 @@
-import asyncio, os, sys, time, json, threading, queue, re, io, random, collections, ctypes, subprocess
+import asyncio, os, sys, time, json, threading, queue, re, io, random, collections, ctypes, subprocess, sqlite3
 from ctypes import wintypes
 from datetime import datetime
-from jarvis_auth import AuthStore, AuthenticationError, DEFAULT_ADMIN_NAME
+from jarvis_auth import (
+    AuthenticationError,
+    DEFAULT_ADMIN_NAME,
+    LocalChatStore,
+    SupabaseAuthStore,
+)
 try:
     import numpy as np
     import sounddevice as sd
@@ -107,9 +112,15 @@ win_lock = threading.Lock()
 noise, echo_g, barge_boost = 0.004, 0.6, 1.0
 chat_seq = 0
 chat_log = collections.OrderedDict()
+message_save_times = {}
 auth_store = None
+private_store = None
 active_user = None
 active_session_id = None
+active_session_store = "cloud"
+private_mode = False
+cloud_memory_snapshot = None
+auth_setup = False
 auth_mode = "login"
 auth_username = None
 auth_error = ""
@@ -131,9 +142,12 @@ def new_id():
 memory_on = False
 stored, recent = [], []
 
-def disk_write():
+def save_profile():
+    global auth_error
     if not auth_store or not active_user:
-        return
+        return True
+    if private_mode:
+        return True
     try:
         auth_store.save_profile(
             active_user["id"],
@@ -142,22 +156,40 @@ def disk_write():
         )
     except Exception as e:
         print(f"[Memory save error: {e}]")
+        auth_error = "Cloud profile save failed. Check the Supabase connection."
+        auth_message()
+        return False
+    return True
 
 def auth_message_dict(error=None, history=None):
+    global auth_error
     with auth_lock:
+        users = []
+        if active_user and active_user["role"] == "admin":
+            try:
+                users = auth_store.list_users()
+            except Exception as cloud_error:
+                auth_error = "Cloud account data could not be loaded."
+                print(f"[Cloud account-list error: {cloud_error}]")
         return {
             "action": "auth",
             "required": active_user is None,
-            "setup": bool(auth_store and not auth_store.has_admin()),
+            "setup": auth_setup,
             "mode": auth_mode,
             "admin_name": DEFAULT_ADMIN_NAME,
             "login_username": auth_username,
             "gender_required": bool(active_user and not active_user.get("gender")),
             "user": dict(active_user) if active_user else None,
             "management": dict(auth_management) if auth_management else None,
-            "users": auth_store.list_users() if active_user and active_user["role"] == "admin" else [],
+            "users": users,
             "error": error if error is not None else auth_error,
             "history": history,
+            "active_conversation_id": (
+                f"private:{active_session_id}"
+                if active_session_id is not None and active_session_store == "local"
+                else active_session_id
+            ),
+            "private_mode": private_mode,
         }
 
 def auth_message(error=None, history=None):
@@ -202,33 +234,22 @@ def set_add_user_username(value):
     set_state("standby")
 
 def activate_user(user):
-    global active_user, active_session_id, memory_on, chat_seq, auth_epoch
-    global auth_error, auth_management, auth_username, auth_mode
+    global active_user, active_session_id, active_session_store, private_mode, memory_on, chat_seq, auth_epoch
+    global auth_error, auth_management, auth_username, auth_mode, cloud_memory_snapshot
     with auth_lock:
-        history = auth_store.recent_messages(user["id"])
+        history = []
         memory_on, saved_memory = auth_store.load_profile(user["id"])
         loaded_memory = json.loads(saved_memory)
         if not isinstance(loaded_memory, list):
             raise ValueError("Saved user memory must be a list.")
         active_user = user
         active_session_id = auth_store.start_session(user["id"])
+        active_session_store = "cloud"
+        private_mode = False
+        cloud_memory_snapshot = None
         stored[:] = loaded_memory[-200:]
-        recent[:] = [
-            {
-                "role": "user" if item["from"] == "you" else "assistant",
-                "content": item["text"],
-            }
-            for item in history[-6:]
-        ]
+        recent.clear()
         chat_log.clear()
-        for item in history:
-            try:
-                chat_seq = max(chat_seq, int(item["id"]))
-            except (TypeError, ValueError):
-                pass
-            chat_log[item["id"]] = (item["from"], item["text"])
-        while len(chat_log) > 60:
-            chat_log.popitem(last=False)
         auth_management = None
         auth_username = None
         auth_mode = "login" if user.get("gender") else "gender_setup"
@@ -243,11 +264,22 @@ def activate_user(user):
                 "How should I greet you? Choose a gender option or prefer not to say in the window."
             )
     auth_message(history=history)
+    push_conversations()
     push_state()
 
 def end_user_session(next_mode="login", error=""):
-    global active_user, active_session_id, auth_mode, auth_username, auth_error, auth_management, auth_epoch, memory_on, silent
+    global active_user, active_session_id, active_session_store, private_mode, cloud_memory_snapshot, auth_mode, auth_username, auth_error, auth_management, auth_epoch, memory_on, silent
     with auth_lock:
+        if cloud_memory_snapshot is not None:
+            memory_on, saved_memory = cloud_memory_snapshot
+            stored[:] = saved_memory
+            cloud_memory_snapshot = None
+            private_mode = False
+        if active_user and active_session_id is not None:
+            if not save_profile():
+                raise RuntimeError(auth_error)
+            current_store = private_store if active_session_store == "local" else auth_store
+            current_store.end_session(active_session_id)
         auth_ready.clear()
         auth_epoch += 1
         if SPK is not None:
@@ -255,11 +287,10 @@ def end_user_session(next_mode="login", error=""):
         silent = False
         if MIC is not None:
             MIC.set_muted(next_mode == "admin_takeover")
-        if active_user and active_session_id is not None:
-            disk_write()
-            auth_store.end_session(active_session_id)
         active_user = None
         active_session_id = None
+        active_session_store = "cloud"
+        private_mode = False
         memory_on = False
         auth_mode = next_mode
         auth_username = DEFAULT_ADMIN_NAME if next_mode == "admin_takeover" else None
@@ -290,10 +321,175 @@ def set_memory(on):
     if on == memory_on: return
     if on: stored.extend(recent)
     memory_on = on
-    disk_write(); push_state()
+    save_profile(); push_state()
 
 def wipe_memory():
-    stored.clear(); disk_write(); push_state()
+    stored.clear(); save_profile(); push_state()
+
+def push_conversations():
+    if not active_user:
+        return
+    regular, archived = conversations_for_user(active_user["id"])
+    _broadcast(json.dumps({
+        "action": "conversations",
+        "items": regular,
+        "archived_items": archived,
+        "active_id": active_conversation_id(),
+    }))
+
+def conversations_for_user(user_id):
+    regular = auth_store.list_conversations(user_id)
+    archived = auth_store.list_conversations(user_id, archived=True)
+    if private_store is not None:
+        regular += private_store.list_conversations(user_id)
+        archived += private_store.list_conversations(user_id, archived=True)
+    regular.sort(key=lambda item: item["started_at"], reverse=True)
+    archived.sort(key=lambda item: item["started_at"], reverse=True)
+    return regular, archived
+
+def active_conversation_id():
+    if active_session_id is not None and active_session_store == "local":
+        return f"private:{active_session_id}"
+    return active_session_id
+
+def archive_history():
+    if not active_user:
+        raise AuthenticationError("Sign in before archiving discussions.")
+    auth_store.archive_all_conversations(active_user["id"])
+    if private_store is not None:
+        private_store.archive_all_conversations(active_user["id"])
+    new_conversation()
+
+def permanently_delete_history():
+    global memory_on, active_session_id, active_session_store, private_mode, cloud_memory_snapshot, auth_epoch, auth_management
+    if not active_user:
+        raise AuthenticationError("Sign in before deleting discussions.")
+    user_id = active_user["id"]
+    auth_store.delete_all_conversations(user_id)
+    if private_store is not None:
+        private_store.delete_all_conversations(user_id)
+    stored.clear()
+    recent.clear()
+    chat_log.clear()
+    message_save_times.clear()
+    memory_on = False
+    active_session_store = "cloud"
+    private_mode = False
+    cloud_memory_snapshot = None
+    active_session_id = auth_store.start_session(user_id)
+    auth_epoch += 1
+    auth_management = None
+    auth_message(history=[])
+    push_conversations()
+    push_state()
+
+def set_conversation_archived(conversation_id, archived):
+    if not active_user:
+        raise AuthenticationError("Sign in before changing archived discussions.")
+    is_private = isinstance(conversation_id, str) and conversation_id.startswith("private:")
+    session_id = (
+        int(conversation_id.split(":", 1)[1])
+        if is_private
+        else int(conversation_id)
+    )
+    store = private_store if is_private else auth_store
+    if store is None:
+        raise RuntimeError("Local private chat storage is unavailable.")
+    store.set_conversation_archived(active_user["id"], session_id, archived)
+
+def set_private_mode(enabled):
+    if not active_user:
+        raise AuthenticationError("Sign in before changing privacy mode.")
+    switch_private_context(bool(enabled))
+    new_conversation(private=enabled)
+
+def switch_private_context(enabled):
+    global private_mode, cloud_memory_snapshot, memory_on
+    if enabled == private_mode:
+        return
+    if enabled:
+        cloud_memory_snapshot = (memory_on, list(stored))
+        private_mode = True
+        return
+    if cloud_memory_snapshot is not None:
+        memory_on, saved_memory = cloud_memory_snapshot
+        stored[:] = saved_memory
+        cloud_memory_snapshot = None
+    private_mode = False
+
+def new_conversation(private=None):
+    global active_session_id, active_session_store, private_mode, auth_epoch
+    if not active_user:
+        raise AuthenticationError("Sign in before starting a discussion.")
+    if SPK is not None:
+        SPK.stop_now()
+    if active_session_id is not None:
+        current_store = private_store if active_session_store == "local" else auth_store
+        current_store.end_session(active_session_id)
+    if private is not None:
+        private_mode = bool(private)
+    active_session_store = "local" if private_mode else "cloud"
+    target_store = private_store if private_mode else auth_store
+    if target_store is None:
+        raise RuntimeError("Local private chat storage is unavailable.")
+    active_session_id = target_store.start_session(active_user["id"])
+    auth_epoch += 1
+    recent.clear()
+    chat_log.clear()
+    message_save_times.clear()
+    while not text_queue.empty():
+        try:
+            text_queue.get_nowait()
+        except queue.Empty:
+            break
+    auth_message(history=[])
+    push_conversations()
+    set_state(ready_state())
+
+def open_conversation(conversation_id):
+    global active_session_id, active_session_store, auth_epoch
+    if not active_user:
+        raise AuthenticationError("Sign in before opening a discussion.")
+    private = isinstance(conversation_id, str) and conversation_id.startswith("private:")
+    session_id = int(conversation_id.split(":", 1)[1]) if private else int(conversation_id)
+    target_store = private_store if private else auth_store
+    if target_store is None:
+        raise RuntimeError("Local private chat storage is unavailable.")
+    if SPK is not None:
+        SPK.stop_now()
+    target_store.activate_session(active_user["id"], session_id)
+    active_session_id = session_id
+    active_session_store = "local" if private else "cloud"
+    switch_private_context(private)
+    auth_epoch += 1
+    while not text_queue.empty():
+        try:
+            text_queue.get_nowait()
+        except queue.Empty:
+            break
+    history = target_store.recent_messages(
+        active_user["id"], session_id=active_session_id
+    )
+    recent[:] = [
+        {
+            "role": "user" if item["from"] == "you" else "assistant",
+            "content": item["text"],
+        }
+        for item in history[-6:]
+    ]
+    chat_log.clear()
+    message_save_times.clear()
+    for item in history:
+        try:
+            chat_seq = max(chat_seq, int(item["id"]))
+        except (TypeError, ValueError):
+            pass
+        chat_log[item["id"]] = (item["from"], item["text"])
+    while len(chat_log) > 60:
+        chat_log.popitem(last=False)
+    auth_message(history=history)
+    push_conversations()
+    set_state(ready_state())
 
 # ---------- WEBSOCKET ----------
 def _broadcast(msg):
@@ -305,6 +501,7 @@ def _broadcast(msg):
 def state_msg():
     return json.dumps({"action": "state", "state": state, "mini": ui_mini, "silent": silent, "online": online,
                        "memory": memory_on, "text_mode": text_mode, "output": output_pref,
+                       "private_mode": private_mode,
                        "user": active_user["username"] if active_user else None,
                        "role": active_user["role"] if active_user else None,
                        "engine": {"mode": forced_engine, "name": active["name"], "model": active["model"]}})
@@ -321,21 +518,38 @@ def ready_state():
 def set_active(name, model):
     active["name"], active["model"] = name, model; push_state()
 
-def push_chat(mid, who, text):
+def push_chat(mid, who, text, persist=False):
+    global auth_error
     turn_epoch = getattr(turn_context, "epoch", None)
     if turn_epoch is not None and turn_epoch != auth_epoch:
         return
     chat_log[mid] = (who, text)
     while len(chat_log) > 60: chat_log.popitem(last=False)
-    if active_user and active_session_id is not None:
-        auth_store.save_message(
-            active_user["id"],
-            active_session_id,
-            mid,
-            "user" if who == "you" else "assistant",
-            text,
-        )
+    now = time.monotonic()
+    should_persist = (
+        who == "you"
+        or persist
+        or now - message_save_times.get(mid, 0) >= 1.0
+    )
+    if active_user and active_session_id is not None and should_persist:
+        try:
+            target_store = private_store if active_session_store == "local" else auth_store
+            target_store.save_message(
+                active_user["id"],
+                active_session_id,
+                mid,
+                "user" if who == "you" else "assistant",
+                text,
+            )
+            message_save_times[mid] = now
+        except Exception as error:
+            print(f"[Cloud conversation save error: {error}]")
+            with auth_lock:
+                auth_error = "Conversation save failed. Check the selected storage is available."
+            auth_message()
     _broadcast(json.dumps({"action": "chat", "id": mid, "from": who, "text": text}))
+    if who == "you":
+        push_conversations()
 
 def set_text_mode(on):
     global text_mode
@@ -352,13 +566,16 @@ def set_output_preference(mode):
     return True
 
 def handle_auth_action(data):
-    global auth_error, auth_mode, auth_management, auth_username, active_user
+    global auth_error, auth_mode, auth_management, auth_username, active_user, auth_setup
     action = data.get("do")
     try:
-        if action == "bootstrap":
+        if action == "close_app":
+            close_jarvis()
+        elif action == "bootstrap":
             if active_user or auth_store.has_admin():
                 raise AuthenticationError("Administrator setup is already complete.")
             user = auth_store.bootstrap_admin(data.get("pin", ""))
+            auth_setup = False
             activate_user(user)
         elif action == "username":
             set_login_username(data.get("username", ""))
@@ -410,6 +627,25 @@ def handle_auth_action(data):
             if active_user is None:
                 raise AuthenticationError("There is no signed-in session.")
             end_user_session()
+        elif action == "new_conversation":
+            new_conversation()
+        elif action == "open_conversation":
+            open_conversation(data.get("conversation_id"))
+        elif action == "set_private_mode":
+            set_private_mode(data.get("enabled", False))
+        elif action == "archive_history":
+            archive_history()
+        elif action == "restore_conversation":
+            set_conversation_archived(data.get("conversation_id"), False)
+            push_conversations()
+        elif action == "open_permanent_delete_history":
+            auth_management = {"mode": "permanently_delete_history"}
+            auth_error = ""
+            auth_message()
+        elif action == "permanently_delete_history":
+            if not auth_management or auth_management.get("mode") != "permanently_delete_history":
+                raise AuthenticationError("Confirm permanent deletion in the window first.")
+            permanently_delete_history()
         elif action == "open_add_user":
             if not active_user or active_user["role"] != "admin":
                 raise AuthenticationError("Only the signed-in administrator can add users.")
@@ -468,15 +704,27 @@ def handle_auth_action(data):
             auth_message()
         else:
             raise AuthenticationError("That account action is not supported.")
-    except (AuthenticationError, TypeError, ValueError) as error:
+    except (AuthenticationError, TypeError, ValueError, RuntimeError, sqlite3.Error) as error:
         with auth_lock:
-            auth_error = str(error)
+            auth_error = (
+                "Local private-chat storage is unavailable."
+                if isinstance(error, sqlite3.Error)
+                else str(error)
+            )
         auth_message()
 
 async def ws_handler(websocket):
     connected_clients.add(websocket)
     await websocket.send(state_msg())
     await websocket.send(json.dumps(auth_message_dict()))
+    if active_user:
+        conversations, archived = conversations_for_user(active_user["id"])
+        await websocket.send(json.dumps({
+            "action": "conversations",
+            "items": conversations,
+            "archived_items": archived,
+            "active_id": active_conversation_id(),
+        }))
     for mid, (who, text) in list(chat_log.items()):          
         await websocket.send(json.dumps({"action": "chat", "id": mid, "from": who, "text": text}))
     try:
@@ -522,7 +770,6 @@ def heartbeat():
     while True:
         time.sleep(1.5)
         push_state()
-        auth_message()
 
 # ---------- WINDOW ----------
 def glide(x2, y2, ms=350, steps=18):
@@ -988,6 +1235,30 @@ CONTROL_REQUEST = re.compile(
     r"go quiet|stop talking|be quiet)\b",
     re.IGNORECASE,
 )
+PRIVATE_ON_REQUEST = re.compile(
+    r"\b(?:go|switch|turn|keep|make|start)\s+(?:(?:this|it|the)\s+)?"
+    r"(?:discussion\s+)?(?:incognito|private)\b|"
+    r"\b(?:incognito|private)\s+mode\b",
+    re.IGNORECASE,
+)
+PRIVATE_OFF_REQUEST = re.compile(
+    r"\b(?:leave|exit|stop|disable|turn off|switch off)\s+(?:the\s+)?"
+    r"(?:incognito|private)(?:\s+mode)?\b|"
+    r"\b(?:go|switch)\s+back\s+to\s+(?:cloud|normal|regular)\b",
+    re.IGNORECASE,
+)
+PERMANENT_DELETE_CHAT_REQUEST = re.compile(
+    r"\b(?:permanently|forever|completely)\s+(?:delete|erase|remove)\b"
+    r".{0,50}\b(?:chat|conversation)s?(?:\s+history)?\b|"
+    r"\b(?:delete|erase|remove)\s+(?:my\s+)?(?:chat|conversation)s?"
+    r"(?:\s+history)?\s+permanently\b",
+    re.IGNORECASE,
+)
+ARCHIVE_CHAT_REQUEST = re.compile(
+    r"\b(?:delete|clear|hide|archive)\s+(?:(?:all|the)\s+)?"
+    r"(?:my\s+)?(?:chat|conversation)s?(?:\s+history)?\b",
+    re.IGNORECASE,
+)
 CLOSE_REQUEST = re.compile(
     r"\bjarvis\b.{0,40}\b(?:close|quit|exit|terminate|shutdown|shut down)\b|"
     r"\b(?:close|quit|exit|terminate|shutdown|shut down)\b.{0,40}\b"
@@ -1294,7 +1565,7 @@ def text_stream(chunks, mid):
         if time.time() - last > 0.06:
             push_chat(mid, "jarvis", buf); last = time.time()
     buf = buf.strip() or "…"
-    push_chat(mid, "jarvis", buf)
+    push_chat(mid, "jarvis", buf, persist=True)
     print(f"Jarvis (text): {buf}")
     return buf
 
@@ -1335,20 +1606,22 @@ def chat(text, source, route):
         said = []
         barge = speak_stream(sentences(llm_stream(msgs, route["deep"])), said, mid)
         reply = " ".join(said).strip()
+        push_chat(mid, "jarvis", reply or "(interrupted)", persist=True)
     else:
         reply = text_stream(llm_stream(msgs, route["deep"]), mid)
         set_state(ready_state())
     pair = [{"role": "user", "content": text}, {"role": "assistant", "content": reply or "(interrupted)"}]
     recent.extend(pair); del recent[:-12]
     if memory_on:
-        stored.extend(pair); del stored[:-200]; disk_write()
+        stored.extend(pair); del stored[:-200]; save_profile()
     return barge
 
 def handle(text, source):
     global auth_management, auth_error
     if source == "voice" and (silent or not online) and len(text.split()) > 15:
         set_state(ready_state()); return None
-    if source == "text":
+    private_on = bool(PRIVATE_ON_REQUEST.search(text))
+    if source == "text" and not private_on:
         push_chat(new_id(), "you", text)
         set_state("processing")
     takeover = ADMIN_TAKEOVER_REQUEST.search(text)
@@ -1386,6 +1659,37 @@ def handle(text, source):
             auth_error = ""
         auth_message()
         return reply_text("Choose the account to disable.", source)
+    if private_on or PRIVATE_OFF_REQUEST.search(text):
+        enabled = private_on
+        if enabled != private_mode:
+            set_private_mode(enabled)
+        if enabled and source == "voice":
+            push_chat(new_id(), "you", text)
+        elif enabled and source == "text":
+            push_chat(new_id(), "you", text)
+        message = (
+            "This discussion is private and stored only on this computer."
+            if enabled
+            else "Private mode is off. New discussions will be stored in your cloud history."
+        )
+        return reply_text(message, source)
+    if PERMANENT_DELETE_CHAT_REQUEST.search(text):
+        if source == "voice":
+            push_chat(new_id(), "you", text)
+        with auth_lock:
+            auth_management = {"mode": "permanently_delete_history"}
+            auth_error = ""
+        auth_message()
+        return reply_text(
+            "I'll permanently erase your chat history after you confirm in the window.",
+            source,
+        )
+    if ARCHIVE_CHAT_REQUEST.search(text):
+        archive_history()
+        return reply_text(
+            "Your conversations are archived. Open Archived in the sidebar to restore them.",
+            source,
+        )
     if CLOSE_REQUEST.search(text):
         close_jarvis()
         return None
@@ -1540,8 +1844,10 @@ def jarvis_brain():
         greeting_pending = True
 
 if __name__ == "__main__":
-    auth_store = AuthStore()
-    if auth_store.has_admin():
+    auth_store = SupabaseAuthStore()
+    private_store = LocalChatStore()
+    auth_setup = not auth_store.has_admin()
+    if not auth_setup:
         auth_prompt_queue.put(
             "Who's using Jarvis? Say your username, or type it on screen."
         )
@@ -1573,14 +1879,19 @@ if __name__ == "__main__":
         main_window.evaluate_js("""
         window.__jarvisCameraPermissionReady = true;
         let ws;
+        const pending = [];
         function connect() {
           ws = new WebSocket('ws://localhost:8000');
-          ws.onopen = () => { window.__jarvisLinked = true; };
+          ws.onopen = () => {
+            window.__jarvisLinked = true;
+            while (pending.length && ws.readyState === 1) ws.send(JSON.stringify(pending.shift()));
+          };
           ws.onclose = () => { window.__jarvisLinked = false; setTimeout(connect, 1000); };
           ws.onmessage = (e) => {
             const d = JSON.parse(e.data);
             if (d.action === 'state') window.dispatchEvent(new CustomEvent('jarvisState', { detail: d }));
             else if (d.action === 'chat') window.dispatchEvent(new CustomEvent('jarvisChat', { detail: d }));
+            else if (d.action === 'conversations') window.dispatchEvent(new CustomEvent('jarvisConversations', { detail: d }));
             else if (d.action === 'auth') {
               window.__jarvisAuthenticated = Boolean(d.user && !d.required && !d.gender_required);
               window.dispatchEvent(new CustomEvent('jarvisAuth', { detail: d }));
@@ -1588,7 +1899,10 @@ if __name__ == "__main__":
           };
         }
         connect();
-        const out = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+        const out = (o) => {
+          if (ws && ws.readyState === 1) ws.send(JSON.stringify(o));
+          else pending.push(o);
+        };
         window.addEventListener('jarvisCommand', (ev) => out({ action: 'command', text: ev.detail }));
         window.addEventListener('jarvisAction', (ev) => out(ev.detail));
         window.addEventListener('jarvisAuthAction', (ev) => out({ action: 'auth', ...ev.detail }));

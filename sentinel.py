@@ -17,8 +17,9 @@ START_SCRIPT = os.path.join(BASE, "Start_Jarvis.bat")
 LOG_FILE = os.path.join(BASE, "sentinel_log.txt")
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4000
-WAKE_WORDS = ("jarvis", "jervis", "service")
-WAKE_COOLDOWN_SECONDS = 6
+WAKE_PHRASES = {"jarvis", "hey jarvis", "okay jarvis"}
+WAKE_COOLDOWN_SECONDS = 10
+MIN_WAKE_CONFIDENCE = 0.75
 BACKEND_ADDRESS = ("127.0.0.1", 8000)
 MUTEX_NAME = "Local\\IronManAISentinel"
 CREATE_NO_WINDOW = 0x08000000
@@ -52,13 +53,24 @@ def jarvis_is_running():
         return False
 
 
+def wake_phrase_matches(result):
+    text = " ".join(result.get("text", "").lower().split())
+    if text not in WAKE_PHRASES:
+        return False
+    words = result.get("result") or []
+    return bool(words) and all(
+        word.get("conf", 0.0) >= MIN_WAKE_CONFIDENCE for word in words
+    )
+
+
 def wake_word_heard(model):
     audio_queue = queue.Queue(maxsize=24)
     recognizer = KaldiRecognizer(
         model,
         SAMPLE_RATE,
-        json.dumps([*WAKE_WORDS, "[unk]"]),
+        json.dumps(["jarvis", "hey jarvis", "okay jarvis", "[unk]"]),
     )
+    recognizer.SetWords(True)
 
     def receive_audio(indata, frames, timing, status):
         try:
@@ -82,14 +94,12 @@ def wake_word_heard(model):
 
             if recognizer.AcceptWaveform(audio):
                 result = json.loads(recognizer.Result())
-                text = result.get("text", "").lower()
             else:
-                partial = json.loads(recognizer.PartialResult())
-                text = partial.get("partial", "").lower()
+                continue
 
-            words = text.split()
-            if "[unk]" not in words and any(word in words for word in WAKE_WORDS):
-                log(f"Wake word detected: {text}")
+            if wake_phrase_matches(result):
+                text = " ".join(result.get("text", "").lower().split())
+                log(f"Wake phrase confirmed: {text}")
                 return True
     return False
 

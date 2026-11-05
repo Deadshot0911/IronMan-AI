@@ -3,7 +3,24 @@
 import { useState, useRef, useMemo, useEffect } from "react";
 import type { ReactNode, CSSProperties } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Mic, MicOff, MessageSquare, History, Cpu, Minimize2, Maximize2, SendHorizontal, X } from "lucide-react";
+import {
+  Mic,
+  MicOff,
+  MessageSquare,
+  History,
+  Cpu,
+  Minimize2,
+  Maximize2,
+  SendHorizontal,
+  X,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  Archive,
+  RotateCcw,
+  Shield,
+  Trash2,
+} from "lucide-react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import "./jarvis-glass.css";
@@ -28,6 +45,16 @@ type AuthState = {
   users: AuthUser[];
   error: string;
   history?: Msg[] | null;
+  active_conversation_id?: number | string | null;
+  private_mode?: boolean;
+};
+type Conversation = {
+  id: number | string;
+  title: string;
+  started_at: string;
+  active: boolean;
+  private?: boolean;
+  archived?: boolean;
 };
 type ControlButton = {
   id: string;
@@ -42,7 +69,15 @@ type ControlButton = {
   redTint?: boolean;
 };
 
-function AuthScreen({ auth, send }: { auth: AuthState; send: (data: object) => void }) {
+function AuthScreen({
+  auth,
+  send,
+  close,
+}: {
+  auth: AuthState;
+  send: (data: object) => void;
+  close: () => void;
+}) {
   const [username, setUsername] = useState(
     auth.setup || auth.mode === "admin_takeover" ? auth.admin_name : "",
   );
@@ -81,6 +116,29 @@ function AuthScreen({ auth, send }: { auth: AuthState; send: (data: object) => v
         fontFamily: MONO,
       }}
     >
+      <button
+        type="button"
+        onClick={close}
+        aria-label="Close Jarvis"
+        title="Close Jarvis"
+        style={{
+          position: "fixed",
+          top: 24,
+          right: 24,
+          zIndex: 400,
+          width: 44,
+          height: 44,
+          borderRadius: "50%",
+          display: "grid",
+          placeItems: "center",
+          color: "#ff9aaa",
+          border: "1px solid rgba(255,154,170,0.28)",
+          background: "rgba(12,21,29,0.78)",
+          cursor: "pointer",
+        }}
+      >
+        <X size={20} />
+      </button>
       <form
         onSubmit={submit}
         style={{
@@ -183,7 +241,15 @@ function AuthScreen({ auth, send }: { auth: AuthState; send: (data: object) => v
   );
 }
 
-function GenderSetup({ auth, send }: { auth: AuthState; send: (data: object) => void }) {
+function GenderSetup({
+  auth,
+  send,
+  close,
+}: {
+  auth: AuthState;
+  send: (data: object) => void;
+  close: () => void;
+}) {
   return (
     <main
       style={{
@@ -197,6 +263,29 @@ function GenderSetup({ auth, send }: { auth: AuthState; send: (data: object) => 
         fontFamily: MONO,
       }}
     >
+      <button
+        type="button"
+        onClick={close}
+        aria-label="Close Jarvis"
+        title="Close Jarvis"
+        style={{
+          position: "fixed",
+          top: 24,
+          right: 24,
+          zIndex: 400,
+          width: 44,
+          height: 44,
+          borderRadius: "50%",
+          display: "grid",
+          placeItems: "center",
+          color: "#ff9aaa",
+          border: "1px solid rgba(255,154,170,0.28)",
+          background: "rgba(12,21,29,0.78)",
+          cursor: "pointer",
+        }}
+      >
+        <X size={20} />
+      </button>
       <section
         role="dialog"
         aria-modal="true"
@@ -302,6 +391,18 @@ const authDangerButton: CSSProperties = {
   borderColor: "rgba(255,84,112,0.5)",
   color: "#ff9aaa",
 };
+const discussionIconButton: CSSProperties = {
+  width: 32,
+  height: 32,
+  flex: "0 0 auto",
+  display: "grid",
+  placeItems: "center",
+  border: "1px solid rgba(34,229,255,0.14)",
+  borderRadius: 8,
+  color: "#bfefff",
+  background: "rgba(255,255,255,0.035)",
+  cursor: "pointer",
+};
 
 function UserManagementDialog({
   auth,
@@ -367,10 +468,18 @@ function UserManagementDialog({
         }}
       >
         <h2 id="user-management-title" style={{ margin: "0 0 8px", fontSize: 18 }}>
-          {adding ? "ADD A USER" : target ? "DISABLE ACCOUNT?" : "MANAGE USERS"}
+          {auth.management.mode === "permanently_delete_history"
+            ? "PERMANENTLY DELETE HISTORY?"
+            : adding
+            ? "ADD A USER"
+            : target
+            ? "DISABLE ACCOUNT?"
+            : "MANAGE USERS"}
         </h2>
         <p style={{ margin: "0 0 18px", color: "rgba(190,239,255,0.65)", fontSize: 12, lineHeight: 1.6 }}>
-          {adding
+          {auth.management.mode === "permanently_delete_history"
+            ? "This permanently deletes all your cloud conversations, private local discussions, and saved Jarvis memory. Your account remains."
+            : adding
             ? usernameStep
               ? "Say the new user's name, or type it below. PINs are entered only here."
               : "Choose and confirm a 4–8 digit PIN. Their conversation history will be separate."
@@ -378,7 +487,19 @@ function UserManagementDialog({
             ? `${target.username}'s account will be disabled. Their saved history will be retained.`
             : "Disabled accounts cannot sign in. Their saved history is retained."}
         </p>
-        {adding ? (
+        {auth.management.mode === "permanently_delete_history" ? (
+          <div style={{ display: "flex", gap: 10 }}>
+            <button onClick={() => send({ do: "close_management" })} style={authSecondaryButton}>
+              CANCEL
+            </button>
+            <button
+              onClick={() => send({ do: "permanently_delete_history" })}
+              style={authDangerButton}
+            >
+              DELETE EVERYTHING
+            </button>
+          </div>
+        ) : adding ? (
           <form onSubmit={addUser}>
             {usernameStep ? (
               <label style={authLabel}>
@@ -796,6 +917,12 @@ export default function JarvisUI() {
   const [hoveredButton, setHoveredButton] = useState<string | null>(null);
   const [vp, setVp] = useState({ w: 1280, h: 800 });
   const [messages, setMessages] = useState<Msg[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<number | string | null>(null);
+  const [sidebarExpanded, setSidebarExpanded] = useState(true);
+  const [privateMode, setPrivateMode] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   const [input, setInput] = useState("");
   const [visionMessage, setVisionMessage] = useState("HAND TRACKING · MAXIMIZE TO ENABLE");
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -804,14 +931,34 @@ export default function JarvisUI() {
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<AuthState>).detail;
       setAuth({ ...detail, ready: true });
+      setPrivateMode(Boolean(detail.private_mode));
       if (detail.required) {
         setMessages([]);
+        setConversations([]);
+        setArchivedConversations([]);
+        setActiveConversationId(null);
       } else if (Array.isArray(detail.history)) {
         setMessages(detail.history);
+        setActiveConversationId(detail.active_conversation_id ?? null);
       }
     };
     window.addEventListener("jarvisAuth", handler);
     return () => window.removeEventListener("jarvisAuth", handler);
+  }, []);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        items: Conversation[];
+        archived_items?: Conversation[];
+        active_id: number | string | null;
+      }>).detail;
+      setConversations(detail.items || []);
+      setArchivedConversations(detail.archived_items || []);
+      setActiveConversationId(detail.active_id ?? null);
+    };
+    window.addEventListener("jarvisConversations", handler);
+    return () => window.removeEventListener("jarvisConversations", handler);
   }, []);
 
   useEffect(() => {
@@ -853,6 +1000,7 @@ export default function JarvisUI() {
       if (typeof s.silent === "boolean") setIsSilent(s.silent);
       if (typeof s.online === "boolean") setIsOnline(s.online);
       if (typeof s.memory === "boolean") setMemoryOn(s.memory);
+      if (typeof s.private_mode === "boolean") setPrivateMode(s.private_mode);
       if (typeof s.text_mode === "boolean") setIsTextMode(s.text_mode);
       if (s.engine) setEngine(s.engine);
     };
@@ -893,6 +1041,7 @@ export default function JarvisUI() {
 
   const act = (o: object) => window.dispatchEvent(new CustomEvent("jarvisAction", { detail: o }));
   const authSend = (data: object) => window.dispatchEvent(new CustomEvent("jarvisAuthAction", { detail: data }));
+  const closeApp = () => authSend({ do: "close_app" });
   const linked = () => !!window.__jarvisLinked;
   const wake = () => {
     window.__jarvisMinimized = false;
@@ -954,6 +1103,7 @@ export default function JarvisUI() {
   const dim = !isOnline || isSilent;
   const lastIsYou = messages.length > 0 && messages[messages.length - 1].from === "you";
   const canManageUsers = auth.user?.role === "admin";
+  const displayedConversations = showArchived ? archivedConversations : conversations;
 
   const compact = vp.w < 320;
   const S = compact ? vp.w - 30 : Math.max(320, Math.min(vp.w, vp.h));
@@ -1036,10 +1186,10 @@ export default function JarvisUI() {
   const slabH = isMinimized ? 200 : "100vh";
 
   if (!auth.ready || auth.required || !auth.user) {
-    return <AuthScreen key={`${auth.mode}-${auth.setup}`} auth={auth} send={authSend} />;
+    return <AuthScreen key={`${auth.mode}-${auth.setup}`} auth={auth} send={authSend} close={closeApp} />;
   }
   if (!auth.user.gender) {
-    return <GenderSetup auth={auth} send={authSend} />;
+    return <GenderSetup auth={auth} send={authSend} close={closeApp} />;
   }
 
   return (
@@ -1067,6 +1217,182 @@ export default function JarvisUI() {
         .jv-scroll::-webkit-scrollbar { width: 6px; }
         .jv-scroll::-webkit-scrollbar-thumb { background: rgba(34,229,255,0.25); border-radius: 3px; }
       `}</style>
+
+      <motion.aside
+        animate={{ width: sidebarExpanded ? 256 : 54 }}
+        transition={{ duration: 0.2, ease: "easeOut" }}
+        style={{
+          position: "fixed",
+          top: 92,
+          bottom: 28,
+          left: 24,
+          zIndex: 120,
+          display: "flex",
+          flexDirection: "column",
+          gap: 12,
+          boxSizing: "border-box",
+          padding: 10,
+          overflow: "hidden",
+          borderRadius: 16,
+          color: "#d4fbff",
+          background: "linear-gradient(145deg, rgba(10,31,42,0.84), rgba(3,10,17,0.78))",
+          border: "1px solid rgba(34,229,255,0.18)",
+          boxShadow: "0 14px 40px rgba(0,0,0,0.4), inset 0 1px rgba(255,255,255,0.08)",
+          backdropFilter: "blur(22px) saturate(145%)",
+          WebkitBackdropFilter: "blur(22px) saturate(145%)",
+        }}
+        aria-label="Previous discussions"
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 7, minHeight: 34 }}>
+          <button
+            type="button"
+            onClick={() => setSidebarExpanded((expanded) => !expanded)}
+            aria-label={sidebarExpanded ? "Collapse discussions sidebar" : "Expand discussions sidebar"}
+            title={sidebarExpanded ? "Collapse sidebar" : "Expand sidebar"}
+            style={discussionIconButton}
+          >
+            {sidebarExpanded ? <PanelLeftClose size={17} /> : <PanelLeftOpen size={17} />}
+          </button>
+          {sidebarExpanded && (
+            <>
+              <span style={{ flex: 1, color: "rgba(190,239,255,0.72)", fontSize: 10, letterSpacing: "0.12em" }}>
+                {showArchived ? "ARCHIVED" : "DISCUSSIONS"}
+              </span>
+              <button
+                type="button"
+                onClick={() => authSend({ do: "new_conversation" })}
+                aria-label="Create a new discussion"
+                title="New discussion"
+                style={discussionIconButton}
+              >
+                <Plus size={17} />
+              </button>
+            </>
+          )}
+        </div>
+        {sidebarExpanded && (
+          <>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button
+                type="button"
+                onClick={() => authSend({ do: "set_private_mode", enabled: !privateMode })}
+                aria-pressed={privateMode}
+                title={privateMode
+                  ? "History is saved only on this computer; your selected AI provider may still process messages."
+                  : "Switch to local-only chat history"}
+                style={{
+                  ...authSecondaryButton,
+                  flex: 1,
+                  padding: "8px 7px",
+                  borderColor: privateMode ? "rgba(34,229,255,0.5)" : "rgba(34,229,255,0.16)",
+                  color: privateMode ? CYAN : "rgba(190,239,255,0.68)",
+                }}
+              >
+                <Shield size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />
+                {privateMode ? "PRIVATE · LOCAL" : "CLOUD"}
+              </button>
+              <button
+                type="button"
+                onClick={() => authSend({ do: "archive_history" })}
+                aria-label="Archive all discussions"
+                title="Hide all conversations in Archived"
+                style={discussionIconButton}
+              >
+                <Archive size={15} />
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowArchived((shown) => !shown)}
+              style={{
+                ...authSecondaryButton,
+                padding: "7px 9px",
+                textAlign: "left",
+                color: showArchived ? CYAN : "rgba(190,239,255,0.62)",
+              }}
+            >
+              {showArchived ? "← BACK TO DISCUSSIONS" : `ARCHIVED · ${archivedConversations.length}`}
+            </button>
+          </>
+        )}
+        {!sidebarExpanded && (
+          <button
+            type="button"
+            onClick={() => authSend({ do: "new_conversation" })}
+            aria-label="Create a new discussion"
+            title="New discussion"
+            style={discussionIconButton}
+          >
+            <Plus size={17} />
+          </button>
+        )}
+        {sidebarExpanded && (
+          <div className="jv-scroll" style={{ display: "grid", alignContent: "start", gap: 6, overflowY: "auto", flex: 1 }}>
+            {displayedConversations.map((conversation) => (
+              <div key={conversation.id} style={{ display: "flex", gap: 4 }}>
+                <button
+                  type="button"
+                  onClick={() => authSend({ do: "open_conversation", conversation_id: conversation.id })}
+                  title={conversation.title}
+                  aria-current={activeConversationId === conversation.id ? "page" : undefined}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    padding: "10px 9px",
+                    overflow: "hidden",
+                    borderRadius: 9,
+                    border: `1px solid ${activeConversationId === conversation.id ? "rgba(34,229,255,0.3)" : "transparent"}`,
+                    color: activeConversationId === conversation.id ? "#e5fcff" : "rgba(190,239,255,0.68)",
+                    background: activeConversationId === conversation.id ? "rgba(34,229,255,0.1)" : "transparent",
+                    textAlign: "left",
+                    font: `11px ${MONO}`,
+                    whiteSpace: "nowrap",
+                    textOverflow: "ellipsis",
+                    cursor: "pointer",
+                  }}
+                >
+                  <span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {conversation.private && <Shield size={12} style={{ verticalAlign: "middle", marginRight: 5 }} />}
+                    {conversation.title}
+                  </span>
+                </button>
+                {showArchived && (
+                  <button
+                    type="button"
+                    aria-label="Restore discussion"
+                    title="Restore discussion"
+                    onClick={() => authSend({ do: "restore_conversation", conversation_id: conversation.id })}
+                    style={discussionIconButton}
+                  >
+                    <RotateCcw size={13} />
+                  </button>
+                )}
+              </div>
+            ))}
+            {displayedConversations.length === 0 && (
+              <span style={{ padding: 8, color: "rgba(190,239,255,0.4)", fontSize: 10, lineHeight: 1.5 }}>
+                {showArchived ? "No archived discussions" : "No previous discussions"}
+              </span>
+            )}
+          </div>
+        )}
+        {sidebarExpanded && (
+          <button
+            type="button"
+            onClick={() => authSend({ do: "open_permanent_delete_history" })}
+            style={{
+              ...authSecondaryButton,
+              padding: "8px 9px",
+              textAlign: "left",
+              borderColor: "rgba(255,84,112,0.3)",
+              color: "#ff9aaa",
+            }}
+          >
+            <Trash2 size={13} style={{ verticalAlign: "middle", marginRight: 6 }} />
+            PERMANENTLY DELETE HISTORY
+          </button>
+        )}
+      </motion.aside>
 
       {/* INFINITE CLEAN GLASS SLAB */}
       <div

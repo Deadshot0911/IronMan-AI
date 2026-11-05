@@ -23,6 +23,9 @@ jarvis_memory.json
 jarvis_users.sqlite3
 jarvis_users.sqlite3-shm
 jarvis_users.sqlite3-wal
+jarvis_private_chats.sqlite3
+jarvis_private_chats.sqlite3-shm
+jarvis_private_chats.sqlite3-wal
 vosk-model/
 vosk-model-small/
 node_modules/
