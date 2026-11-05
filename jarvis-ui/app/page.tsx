@@ -42,7 +42,14 @@ type AuthState = {
   admin_name: string;
   login_username?: string | null;
   user: AuthUser | null;
-  management: { mode: string; step?: string; username?: string; operation?: string; user_id?: number } | null;
+  management: {
+    mode: string;
+    step?: string;
+    username?: string;
+    spelling?: string;
+    operation?: string;
+    user_id?: number;
+  } | null;
   users: AuthUser[];
   user_events: UserEvent[];
   error: string;
@@ -428,11 +435,13 @@ function UserManagementDialog({
   const [pin, setPin] = useState("");
   const [confirmation, setConfirmation] = useState("");
   const [adminPin, setAdminPin] = useState("");
+  const [sessionPin, setSessionPin] = useState("");
 
   if (!auth.management) return null;
   const adding = auth.management.mode === "add_user";
   const managing = auth.management.mode === "users";
   const userAction = auth.management.mode === "user_action";
+  const endingSession = auth.management.mode === "end_session";
   const usernameStep = adding && auth.management.step === "username";
   const spellingStep = adding && auth.management.step === "spelling";
   const genderStep = adding && auth.management.step === "gender";
@@ -441,6 +450,7 @@ function UserManagementDialog({
     event.preventDefault();
     if (usernameStep) {
       send({ do: "set_add_username", username: username.trim() });
+      setUsername("");
       return;
     }
     if (spellingStep) {
@@ -460,6 +470,11 @@ function UserManagementDialog({
     event.preventDefault();
     send({ do: "manage_user", admin_pin: adminPin });
     setAdminPin("");
+  };
+  const confirmEndSession = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    send({ do: "confirm_end_session", user_pin: sessionPin });
+    setSessionPin("");
   };
   const prepareAction = (user: AuthUser, operation: "disable" | "enable" | "delete") =>
     send({ do: "prepare_user_action", user_id: user.id, operation });
@@ -497,7 +512,9 @@ function UserManagementDialog({
         }}
       >
         <h2 id="user-management-title" style={{ margin: "0 0 8px", fontSize: 18 }}>
-          {auth.management.mode === "permanently_delete_history"
+          {endingSession
+            ? "END SESSION · PIN REQUIRED"
+            : auth.management.mode === "permanently_delete_history"
             ? "PERMANENTLY DELETE HISTORY?"
             : adding
             ? "ADD A USER"
@@ -506,13 +523,15 @@ function UserManagementDialog({
             : "MANAGE USERS"}
         </h2>
         <p style={{ margin: "0 0 18px", color: "rgba(190,239,255,0.65)", fontSize: 12, lineHeight: 1.6 }}>
-          {auth.management.mode === "permanently_delete_history"
+          {endingSession
+            ? "Enter your account PIN to end this session and return to sign-in. Your account and chat history will not be deleted."
+            : auth.management.mode === "permanently_delete_history"
             ? "This permanently deletes all your cloud conversations, private local discussions, and saved Jarvis memory. Your account remains."
             : adding
             ? usernameStep
               ? "Say the new user's name, or type it below. PINs are entered only here."
               : spellingStep
-              ? `Say ${auth.management.username}'s spelling one letter at a time, or type it below.`
+              ? `Say ${auth.management.username}'s spelling one letter at a time, then say “done.” Say “clear” to restart, or type the spelling below.`
               : genderStep
               ? `Say ${auth.management.username}'s gender, or choose an option below.`
               : "Choose and confirm a 4–8 digit PIN. Their conversation history will be separate."
@@ -522,7 +541,33 @@ function UserManagementDialog({
               : `Say “confirm” or press Confirm to ${auth.management.operation} ${auth.management.username}. This action requires your administrator PIN.`
             : "Review active, disabled, and recently deleted accounts. Delete permanently removes that user's account and history."}
         </p>
-        {auth.management.mode === "permanently_delete_history" ? (
+        {endingSession ? (
+          <form onSubmit={confirmEndSession}>
+            <label style={authLabel}>
+              YOUR ACCOUNT PIN
+              <input
+                autoFocus
+                autoComplete="current-password"
+                inputMode="numeric"
+                maxLength={8}
+                minLength={4}
+                pattern="[0-9]{4,8}"
+                required
+                type="password"
+                value={sessionPin}
+                onChange={(event) => setSessionPin(event.target.value.replace(/\D/g, "").slice(0, 8))}
+                style={authInput}
+              />
+            </label>
+            {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button type="button" onClick={() => send({ do: "close_management" })} style={authSecondaryButton}>
+                CANCEL
+              </button>
+              <button type="submit" style={authDangerButton}>END SESSION</button>
+            </div>
+          </form>
+        ) : auth.management.mode === "permanently_delete_history" ? (
           <div style={{ display: "flex", gap: 10 }}>
             <button onClick={() => send({ do: "close_management" })} style={authSecondaryButton}>
               CANCEL
@@ -552,6 +597,11 @@ function UserManagementDialog({
               </label>
             ) : (
               <div style={{ ...authInput, marginBottom: 14 }}>{auth.management.username}</div>
+            )}
+            {spellingStep && auth.management.spelling && (
+              <p role="status" style={{ color: CYAN, fontSize: 12, letterSpacing: 2 }}>
+                HEARD SO FAR: {auth.management.spelling.toUpperCase().split("").join(" · ")}
+              </p>
             )}
             {genderStep && (
               <div style={{ display: "grid", gap: 8, marginBottom: 14 }}>
@@ -1187,7 +1237,7 @@ export default function JarvisUI() {
   const statusLabel = !isOnline 
     ? "OFFLINE" 
     : isSilent 
-    ? "MIC MUTED · JARVIS IS DEAF" 
+    ? "MIC MUTED · SAY JARVIS UNMUTE"
     : isSpeaking 
     ? "SPEAKING" 
     : isProcessing 
@@ -1683,9 +1733,9 @@ export default function JarvisUI() {
                         boxShadow: `0 0 8px ${accent}`,
                         transformOrigin: "center",
                         transform: "scaleY(0.2)",
-                        opacity: statusLabel === "STANDBY" || statusLabel === "MIC MUTED · JARVIS IS DEAF" || !isOnline ? 0.35 : 1,
+                        opacity: statusLabel === "STANDBY" || statusLabel === "MIC MUTED · SAY JARVIS UNMUTE" || !isOnline ? 0.35 : 1,
                         animation:
-                          statusLabel === "STANDBY" || statusLabel === "MIC MUTED · JARVIS IS DEAF" || !isOnline
+                          statusLabel === "STANDBY" || statusLabel === "MIC MUTED · SAY JARVIS UNMUTE" || !isOnline
                             ? "none"
                             : `jv-eq ${isProcessing || isSpeaking ? 0.5 : 1.1}s ease-in-out ${i * 0.09}s infinite`,
                       }}

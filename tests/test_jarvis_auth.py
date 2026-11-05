@@ -13,6 +13,7 @@ from jarvis_auth import (
     normalize_gender,
     normalize_login_username,
     normalize_spoken_username,
+    normalize_spoken_spelling,
     username_from_spelling,
 )
 
@@ -26,6 +27,12 @@ class UsernameNormalizationTests(unittest.TestCase):
         self.assertEqual(normalize_spoken_username("s-u-n-r-i-t"), "sunrit")
         self.assertEqual(normalize_spoken_username("jay oh aitch en"), "john")
         self.assertEqual(normalize_spoken_username("double you eye el el"), "will")
+        self.assertEqual(normalize_spoken_spelling("A"), "a")
+        self.assertEqual(normalize_spoken_spelling("bee"), "b")
+        self.assertEqual(normalize_spoken_spelling("you"), "u")
+        self.assertEqual(normalize_spoken_spelling("double you"), "w")
+        self.assertEqual(normalize_spoken_spelling("J O H N"), "john")
+        self.assertEqual(normalize_spoken_spelling("Alex"), "")
         self.assertEqual(normalize_spoken_username("admin").casefold(), "admin")
         self.assertEqual(normalize_login_username("A D M I N"), "Sunrit")
         self.assertEqual(normalize_login_username("s u n r i t").casefold(), "sunrit")

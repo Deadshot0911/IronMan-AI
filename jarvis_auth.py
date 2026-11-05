@@ -23,6 +23,19 @@ NAME_PREFIX_PATTERN = re.compile(
 PBKDF2_ITERATIONS = 240_000
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_SECONDS = 60
+SPOKEN_LETTER_NAMES = {
+    "ay": "a", "a": "a", "bee": "b", "be": "b", "b": "b",
+    "see": "c", "sea": "c", "cee": "c", "c": "c", "dee": "d", "d": "d",
+    "ee": "e", "e": "e", "ef": "f", "eff": "f", "f": "f",
+    "gee": "g", "g": "g", "aitch": "h", "h": "h",
+    "eye": "i", "i": "i", "jay": "j", "j": "j", "kay": "k", "k": "k",
+    "el": "l", "ell": "l", "l": "l", "em": "m", "m": "m",
+    "en": "n", "n": "n", "oh": "o", "o": "o", "pee": "p", "p": "p",
+    "cue": "q", "queue": "q", "q": "q", "are": "r", "ar": "r", "r": "r",
+    "ess": "s", "s": "s", "tee": "t", "t": "t", "you": "u", "u": "u",
+    "vee": "v", "v": "v", "w": "w", "ex": "x", "x": "x",
+    "why": "y", "y": "y", "zee": "z", "zed": "z", "z": "z",
+}
 
 
 def normalize_spoken_username(value):
@@ -32,19 +45,6 @@ def normalize_spoken_username(value):
     name = NAME_PREFIX_PATTERN.sub("", name).strip()
     name = name.strip(" \t\r\n.,!?;:")
     tokens = re.findall(r"[^\W\d_]+", name.casefold(), flags=re.UNICODE)
-    letter_names = {
-        "ay": "a", "a": "a", "bee": "b", "be": "b", "b": "b",
-        "see": "c", "sea": "c", "cee": "c", "c": "c", "dee": "d", "d": "d",
-        "ee": "e", "e": "e", "ef": "f", "eff": "f", "f": "f",
-        "gee": "g", "g": "g", "aitch": "h", "h": "h",
-        "eye": "i", "i": "i", "jay": "j", "j": "j", "kay": "k", "k": "k",
-        "el": "l", "ell": "l", "l": "l", "em": "m", "m": "m",
-        "en": "n", "n": "n", "oh": "o", "o": "o", "pee": "p", "p": "p",
-        "cue": "q", "queue": "q", "q": "q", "are": "r", "ar": "r", "r": "r",
-        "ess": "s", "s": "s", "tee": "t", "t": "t", "you": "u", "u": "u",
-        "vee": "v", "v": "v", "double": "", "w": "w", "ex": "x", "x": "x",
-        "why": "y", "y": "y", "zee": "z", "zed": "z", "z": "z",
-    }
     spelled_tokens = []
     index = 0
     while index < len(tokens):
@@ -55,9 +55,29 @@ def normalize_spoken_username(value):
             spelled_tokens.append(tokens[index])
             index += 1
     tokens = spelled_tokens
-    if len(tokens) > 1 and all(token in letter_names for token in tokens):
-        return "".join(letter_names[token] for token in tokens)
+    if len(tokens) > 1 and all(token in SPOKEN_LETTER_NAMES for token in tokens):
+        return "".join(SPOKEN_LETTER_NAMES[token] for token in tokens)
     return name
+
+
+def normalize_spoken_spelling(value):
+    if not isinstance(value, str):
+        return ""
+    text = value.casefold().strip()
+    text = re.sub(r"^(?:(?:the\s+)?letters?|spell(?:\s+out)?)\s+", "", text)
+    tokens = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
+    spelled_tokens = []
+    index = 0
+    while index < len(tokens):
+        if tokens[index:index + 2] == ["double", "you"]:
+            spelled_tokens.append("w")
+            index += 2
+        else:
+            spelled_tokens.append(tokens[index])
+            index += 1
+    if spelled_tokens and all(token in SPOKEN_LETTER_NAMES for token in spelled_tokens):
+        return "".join(SPOKEN_LETTER_NAMES[token] for token in spelled_tokens)
+    return ""
 
 
 def normalize_login_username(value, admin_name=DEFAULT_ADMIN_NAME):

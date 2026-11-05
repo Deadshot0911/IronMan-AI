@@ -9,6 +9,7 @@ from jarvis_auth import (
     normalize_login_username,
     normalize_gender,
     normalize_spoken_username,
+    normalize_spoken_spelling,
     username_from_spelling,
 )
 try:
@@ -275,7 +276,7 @@ def perform_user_action(data):
         auth_management = None
         auth_error = message
         if MIC is not None:
-            MIC.set_muted(silent)
+            MIC.set_muted(False)
     auth_message()
     auth_prompt_queue.put(message)
 
@@ -321,9 +322,11 @@ def set_add_user_username(value):
         auth_error = ""
     auth_message()
     set_state("standby")
-    auth_prompt_queue.put(f"Please spell {username}, one letter at a time.")
+    auth_prompt_queue.put(
+        f"Please say {username}'s spelling one letter at a time, then say done."
+    )
 
-def set_add_user_spelling(value):
+def set_add_user_spelling(value, complete=False):
     global auth_management, auth_error
     with auth_lock:
         if not active_user or active_user["role"] != "admin":
@@ -334,6 +337,32 @@ def set_add_user_spelling(value):
             or auth_management.get("step") != "spelling"
         ):
             raise AuthenticationError("There is no spelling step open.")
+        if not complete:
+            command = re.sub(r"[^\w\s']", "", str(value or "").casefold()).strip()
+            if command in ("done", "finish", "finished", "that's all", "thats all", "confirm"):
+                value = auth_management.get("spelling", "")
+                if not value:
+                    raise AuthenticationError("I haven't heard any letters yet. Say the spelling, then say done.")
+            elif command in ("clear", "start over", "restart"):
+                auth_management = {**auth_management, "spelling": ""}
+                auth_error = ""
+                auth_message()
+                auth_prompt_queue.put("Spelling cleared. Say the first letter, then say done when finished.")
+                return
+            else:
+                letter = normalize_spoken_spelling(value)
+                if letter:
+                    spelling = auth_management.get("spelling", "") + letter
+                    if len(spelling) > 60:
+                        raise AuthenticationError("The spelling is too long. Say clear to start over.")
+                    auth_management = {**auth_management, "spelling": spelling}
+                    auth_error = ""
+                    auth_message()
+                    auth_prompt_queue.put(
+                        f"Got it, {len(spelling)} letter{'s' if len(spelling) != 1 else ''}. "
+                        "Say the next letter, or say done."
+                    )
+                    return
         username = username_from_spelling(auth_management["username"], value)
         if len(username) > 60 or any(ord(char) < 32 for char in username):
             raise AuthenticationError("Enter a name between 1 and 60 characters.")
@@ -376,6 +405,56 @@ def set_add_user_gender(value):
         f"Gender saved. Enter and confirm the new PIN for {auth_management['username']} in the window."
     )
 
+def set_active_user_gender(value):
+    global active_user, auth_mode, auth_error
+    if not active_user:
+        raise AuthenticationError("Sign in before setting a profile.")
+    auth_store.set_gender(active_user["id"], normalize_gender(value))
+    active_user = auth_store.get_user(active_user["id"])
+    while not auth_prompt_queue.empty():
+        try:
+            auth_prompt_queue.get_nowait()
+        except queue.Empty:
+            break
+    with auth_lock:
+        auth_mode = "login"
+        auth_error = ""
+        if MIC is not None:
+            MIC.set_muted(False)
+        auth_ready.set()
+    auth_message()
+    push_state()
+
+def handle_gender_choice(value):
+    if active_user and auth_mode == "gender_setup":
+        set_active_user_gender(value)
+    else:
+        set_add_user_gender(value)
+
+def request_end_session():
+    global auth_management, auth_error
+    if not active_user:
+        raise AuthenticationError("There is no active user session to end.")
+    with auth_lock:
+        auth_management = {"mode": "end_session", "step": "user_pin"}
+        auth_error = ""
+        if MIC is not None:
+            MIC.set_muted(True)
+    auth_message()
+    auth_prompt_queue.put("Enter your account PIN in the window to end this session.")
+
+def confirm_end_session(data):
+    global auth_error
+    if (
+        not active_user
+        or not auth_management
+        or auth_management.get("mode") != "end_session"
+        or auth_management.get("step") != "user_pin"
+    ):
+        raise AuthenticationError("There is no pending session-end request.")
+    auth_store.authenticate(active_user["username"], data.get("user_pin", ""))
+    end_user_session()
+
 def activate_user(user):
     global active_user, active_session_id, active_session_store, private_mode, memory_on, chat_seq, auth_epoch
     global auth_error, auth_management, auth_username, auth_mode, cloud_memory_snapshot, suspended_user_session
@@ -400,7 +479,7 @@ def activate_user(user):
         auth_error = ""
         auth_epoch += 1
         if MIC is not None:
-            MIC.set_muted(not bool(user.get("gender")) or silent)
+            MIC.set_muted(False)
         if user.get("gender"):
             auth_ready.set()
         else:
@@ -846,25 +925,13 @@ def handle_auth_action(data):
         elif action == "set_gender":
             if not active_user:
                 raise AuthenticationError("Sign in before setting a profile.")
-            auth_store.set_gender(active_user["id"], data.get("gender"))
-            active_user = auth_store.get_user(active_user["id"])
-            while not auth_prompt_queue.empty():
-                try:
-                    auth_prompt_queue.get_nowait()
-                except queue.Empty:
-                    break
-            with auth_lock:
-                auth_mode = "login"
-                auth_error = ""
-                if MIC is not None:
-                    MIC.set_muted(silent)
-                auth_ready.set()
-            auth_message()
-            push_state()
+            set_active_user_gender(data.get("gender"))
         elif action == "logout":
             if active_user is None:
                 raise AuthenticationError("There is no signed-in session.")
-            end_user_session()
+            request_end_session()
+        elif action == "confirm_end_session":
+            confirm_end_session(data)
         elif action == "new_conversation":
             new_conversation()
         elif action == "open_conversation":
@@ -897,15 +964,17 @@ def handle_auth_action(data):
                 auth_error = ""
             auth_message()
             if name:
-                auth_prompt_queue.put(f"Please spell {name}, one letter at a time.")
+                auth_prompt_queue.put(
+                    f"Please say {name}'s spelling one letter at a time, then say done."
+                )
             else:
                 auth_prompt_queue.put("What's the new user's name? Say it, or type it in the window.")
         elif action == "set_add_username":
             set_add_user_username(data.get("username", ""))
         elif action == "set_add_spelling":
-            set_add_user_spelling(data.get("spelling", ""))
+            set_add_user_spelling(data.get("spelling", ""), complete=True)
         elif action == "set_add_gender":
-            set_add_user_gender(data.get("gender", ""))
+            handle_gender_choice(data.get("gender", ""))
         elif action == "add_user":
             if not active_user or active_user["role"] != "admin":
                 raise AuthenticationError("Only the signed-in administrator can add users.")
@@ -935,7 +1004,7 @@ def handle_auth_action(data):
                 auth_management = None
                 auth_error = confirmation
                 if MIC is not None:
-                    MIC.set_muted(silent)
+                    MIC.set_muted(False)
             auth_message()
             auth_prompt_queue.put(confirmation)
         elif action == "open_delete_user":
@@ -956,7 +1025,7 @@ def handle_auth_action(data):
                 auth_management = None
                 auth_error = ""
                 if MIC is not None:
-                    MIC.set_muted(silent)
+                    MIC.set_muted(False)
             auth_message()
         else:
             raise AuthenticationError("That account action is not supported.")
@@ -1069,7 +1138,7 @@ def set_silent(value):
     silent = bool(value)
     if MIC is not None:
         try:
-            MIC.set_muted(silent)
+            MIC.set_muted(False)
         except Exception as e:
             print(f"[Microphone mute error: {e}]")
     push_state()
@@ -1082,7 +1151,7 @@ def act_minimize(mute=None):
         silent = bool(mute)
     if MIC is not None:
         try:
-            MIC.set_muted(silent)
+            MIC.set_muted(False)
         except Exception as e:
             print(f"[Microphone mute error: {e}]")
     if not was: threading.Thread(target=window_to_corner, daemon=True).start()
@@ -1228,79 +1297,107 @@ def speech_thr(): return max(0.009, noise * 2.5)
 def clean(t): return re.sub(r"[^\w\s]", "", t.lower()).strip()
 HALLU = {"thank you", "thanks", "thanks for watching", "thank you for watching", "bye", "you", "so", "oh"}
 
-def transcribe(audio):
+def transcribe(audio, spelling_mode=False, gender_mode=False, wake_only=False):
     buf = io.BytesIO(); sf.write(buf, audio, FS, format="WAV", subtype="PCM_16")
+    prompt = (
+        "The user is spelling a username aloud. Transcribe each spoken letter "
+        "separately as its letter name or letter: A, B, C, D, E, F, G, H, I, "
+        "J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z."
+        if spelling_mode else
+        "The user is choosing a gender option. Transcribe exactly what they say: "
+        "male, female, non-binary, or prefer not to say."
+        if gender_mode else
+        "The microphone is muted. Transcribe only the exact wake command if spoken: "
+        "Jarvis unmute. Do not infer or add words."
+        if wake_only else
+        "J.A.R.V.I.S. Jarvis. Gemini, Groq, Ollama. Mute, unmute, stop listening, "
+        "start listening, text mode, voice mode, memory, minimize, maximize."
+    )
     try:
         r = groq_client.audio.transcriptions.create(
             file=("audio.wav", buf.getvalue()), model="whisper-large-v3-turbo", language="en",
             response_format="verbose_json",
-            prompt="J.A.R.V.I.S. Jarvis. Gemini, Groq, Ollama. Mute, unmute, stop listening, start listening, text mode, voice mode, memory, minimize, maximize.",
+            prompt=prompt,
             temperature=0)
         text = (getattr(r, "text", None) or (r.get("text") if isinstance(r, dict) else "") or "").strip()
         segs = getattr(r, "segments", None) or (r.get("segments") if isinstance(r, dict) else None) or []
         def g(s, k):
             v = s.get(k) if isinstance(s, dict) else getattr(s, k, None)
             return 0.0 if v is None else v
-        if segs and all(g(s, "no_speech_prob") > 0.5 for s in segs):     
+        if (
+            segs
+            and all(g(s, "no_speech_prob") > 0.5 for s in segs)
+            and not spelling_mode
+            and not gender_mode
+            and not wake_only
+        ):
             return None
-        return text if len(text) > 1 else None
+        return text if text and (spelling_mode or gender_mode or wake_only or len(text) > 1) else None
     except Exception as e:
         print(f"[STT error: {e}]"); return None
 
 def listen_fast(allow_unauthenticated=False):
     global noise
     set_state(ready_state())
+    gender_setup = bool(active_user and auth_mode == "gender_setup")
+    spelling_mode = bool(
+        auth_management
+        and auth_management.get("mode") == "add_user"
+        and auth_management.get("step") == "spelling"
+    )
+    gender_mode = bool(
+        (active_user and auth_mode == "gender_setup")
+        or (
+            auth_management
+            and auth_management.get("mode") == "add_user"
+            and auth_management.get("step") == "gender"
+        )
+    )
     ring, pre = collections.deque(maxlen=8), collections.deque(maxlen=10)
     frames, trig, quiet, voiced_n, t0 = [], False, 0, 0, time.time()
-    muted = False
     while True:
         if not auth_prompt_queue.empty():
             set_state("standby")
             return None
-        if allow_unauthenticated and (auth_mode != "login" or auth_username is not None):
-            set_state("standby")
-            return None
-        if auth_ready.is_set() and auth_management and auth_management.get("mode") == "add_user" and auth_management.get("step") != "username":
+        if allow_unauthenticated and not gender_setup and (
+            auth_mode != "login" or auth_username is not None
+        ):
             set_state("standby")
             return None
         if not auth_ready.is_set() and not allow_unauthenticated:
             return None
         if not text_queue.empty(): return None
-        if silent:
-            if not muted:
-                MIC.flush()
-                set_state("standby")
-                muted = True
-            time.sleep(0.2)
-            continue
-        if muted:
-            MIC.flush()
-            set_state(ready_state())
-            muted = False
         f = MIC.read(0.1)
         if f is None:
             if not trig and time.time() - t0 > 20: return None
-            continue
-        if silent:
-            MIC.flush()
             continue
         r = rms(f)
         voiced = r > speech_thr() and is_voice(f)
         if not trig:
             pre.append(f); ring.append(voiced)
             if not voiced and r < noise * 3 + 0.003: noise = 0.97 * noise + 0.03 * r
-            if sum(ring) >= 5: trig, frames, voiced_n = True, list(pre), sum(ring)
+            if sum(ring) >= (3 if spelling_mode or gender_mode else 5):
+                trig, frames, voiced_n = True, list(pre), sum(ring)
             elif time.time() - t0 > 20: return None
         else:
             frames.append(f)
             voiced_n += voiced
             quiet = 0 if voiced else quiet + 1
             if quiet >= END_FRAMES or len(frames) > 500: break
-    if voiced_n < MIN_VOICED_FRAMES: return None
+    min_voiced_frames = 3 if spelling_mode else 4 if gender_mode else MIN_VOICED_FRAMES
+    if voiced_n < min_voiced_frames: return None
     frames = frames[: len(frames) - max(0, quiet - 5)]
     set_state("processing")
-    t = transcribe(np.concatenate(frames))
-    if not t or clean(t) in HALLU or not clean(t):
+    t = transcribe(
+        np.concatenate(frames),
+        spelling_mode=spelling_mode,
+        gender_mode=gender_mode,
+        wake_only=silent,
+    )
+    if silent and (not t or not UNMUTE_REQUEST.fullmatch(clean(t))):
+        set_state("standby")
+        return None
+    if not t or (not spelling_mode and clean(t) in HALLU) or not clean(t):
         set_state(ready_state()); return None
     print(f"You: {t}")
     return t
@@ -1446,7 +1543,9 @@ intent:
 "speak": true only if the user explicitly asks for THIS answer out loud / in voice; false only if they explicitly want it as text; otherwise null.
 
 Actions:
-{"do":"minimize","mute":false} shrink to the corner orb. mute=true when the user wants Jarvis to pause, hold on, hush or give them a moment (then reply MUST be ""); mute=false when he should stay available and keep helping.
+{"do":"minimize","mute":false} shrink to the corner orb. Use mute=true only when the user explicitly asks to mute AND minimize; muting alone must never minimize.
+{"do":"mute"} pause voice input without changing the window size.
+{"do":"unmute"} resume voice input. While muted, only an explicit unmute command is accepted.
 {"do":"maximize"} open to the full view / wake up / come on screen. Does NOT change online or offline.
 {"do":"close"} close the Jarvis window and assistant process while leaving the separate wake listener running.
 {"do":"offline"} stop answering anything until told to return.
@@ -1458,11 +1557,11 @@ Actions:
 
 STATE (given with each input) describes the situation:
 - online=false: Jarvis is offline. Only honour requests that bring him back or move the window (online, maximize, minimize, mode). For anything else addressed to him: intent "command", no actions, and a short reply saying all systems are offline. Talk not for him: "ignore".
-- muted=true: Jarvis is silent. React only to a request to wake or return (maximize or online); everything else is "ignore".
+- muted=true: Jarvis is silent. Only honor an explicit unmute, wake, or return request; ignore other speech.
 Compound requests give several actions, e.g. "go offline and sit in the corner" = offline + minimize(mute=false).
 
 Examples (the user will phrase things differently):
-"hold on a second" -> {"intent":"command","actions":[{"do":"minimize","mute":true}],"reply":"","speak":null,"deep":false}
+"hold on a second" -> {"intent":"command","actions":[{"do":"mute"}],"reply":"","speak":null,"deep":false}
 "tuck yourself away but keep listening" -> {"intent":"command","actions":[{"do":"minimize","mute":false}],"reply":"Of course, I'll stay close.","speak":null,"deep":false}
 "Jarvis, terminate" -> {"intent":"command","actions":[{"do":"close"}],"reply":"","speak":null,"deep":false}
 "you can shut down for now" -> {"intent":"command","actions":[{"do":"offline"}],"reply":"Going offline, Sir.","speak":null,"deep":false}
@@ -1539,6 +1638,25 @@ USER_ACTION_REQUEST = re.compile(
     r"(?:\s+(?:named|called)\s+)?(?:\s+(?P<username>.+?))?[.!?]*$",
     re.IGNORECASE,
 )
+END_SESSION_REQUEST = re.compile(
+    r"^(?:jarvis )?(?:please )?(?:(?:i want to|can you|could you) )?"
+    r"(?:end|terminate|finish|close|log out of|logout of) "
+    r"(?:the |my )?(?:current )?session$|^(?:jarvis )?(?:please )?sign out$",
+    re.IGNORECASE,
+)
+MUTE_MINIMIZE_REQUEST = re.compile(
+    r"^(?:jarvis )?(?:please )?(?:mute and minimi[sz]e|minimi[sz]e and mute)"
+    r"(?: (?:the )?(?:mic|microphone))?$",
+    re.IGNORECASE,
+)
+MUTE_REQUEST = re.compile(
+    r"^(?:jarvis )?(?:please )?mute(?: (?:me|yourself|(?:the )?(?:mic|microphone)))?$",
+    re.IGNORECASE,
+)
+UNMUTE_REQUEST = re.compile(
+    r"^(?:jarvis )?unmute(?: (?:me|yourself|(?:the )?(?:mic|microphone)))?$",
+    re.IGNORECASE,
+)
 DEEP_REQUEST = re.compile(
     r"\b(?:in depth|deep dive|comprehensive|thorough|step by step|research)\b",
     re.IGNORECASE,
@@ -1585,7 +1703,7 @@ def classify(text, source):
 
 def enforce(route, source):
     dos = {a.get("do") for a in route["actions"]}
-    if source == "voice" and silent and route["intent"] != "ignore" and not (dos & {"maximize", "online"}):
+    if source == "voice" and silent and route["intent"] != "ignore" and not (dos & {"maximize", "online", "unmute"}):
         return {**route, "intent": "ignore", "actions": [], "reply": ""}
     if not online:
         route["actions"] = [a for a in route["actions"] if a.get("do") in ("online", "maximize", "minimize", "mode", "close")]
@@ -1601,6 +1719,8 @@ def run_actions(acts):
         if d == "close": close_jarvis()
         elif d == "minimize": act_minimize(bool(a["mute"]) if "mute" in a else None)
         elif d == "maximize": act_maximize()
+        elif d == "mute": set_silent(True)
+        elif d == "unmute": set_silent(False)
         elif d == "offline": online = False
         elif d == "online":
             online, silent = True, False
@@ -1879,6 +1999,27 @@ def chat(text, source, route):
 
 def handle(text, source):
     global auth_management, auth_error
+    command_text = clean(text)
+    if UNMUTE_REQUEST.fullmatch(command_text):
+        set_silent(False)
+        return None
+    if source == "voice" and silent:
+        set_state("standby")
+        return None
+    if MUTE_MINIMIZE_REQUEST.fullmatch(command_text):
+        set_silent(True)
+        act_minimize(mute=True)
+        return None
+    if MUTE_REQUEST.fullmatch(command_text):
+        set_silent(True)
+        return None
+    if END_SESSION_REQUEST.fullmatch(command_text):
+        if not active_user:
+            return None
+        if source == "voice":
+            push_chat(new_id(), "you", text)
+        request_end_session()
+        return None
     if source == "voice" and (silent or not online) and len(text.split()) > 15:
         set_state(ready_state()); return None
     if (
@@ -2053,6 +2194,18 @@ def jarvis_brain():
                 speak_auth_prompt(prompt)
                 continue
             if active_user:
+                if auth_mode == "gender_setup" and audio_ready:
+                    text = listen_fast(allow_unauthenticated=True)
+                    if text and active_user and auth_mode == "gender_setup":
+                        try:
+                            set_active_user_gender(text)
+                        except AuthenticationError as error:
+                            with auth_lock:
+                                auth_error = str(error)
+                            auth_message()
+                            auth_prompt_queue.put(
+                                "Please say male, female, non-binary, or prefer not to say."
+                            )
                 time.sleep(0.1)
                 continue
             if not audio_ready:
@@ -2091,7 +2244,7 @@ def jarvis_brain():
                 if prompt:
                     speak_auth_prompt(prompt)
                 step = auth_management.get("step")
-                if step not in ("username", "spelling"):
+                if step not in ("username", "spelling", "gender"):
                     time.sleep(0.1)
                     continue
                 if MIC is None:
@@ -2104,13 +2257,22 @@ def jarvis_brain():
                             set_add_user_username(text)
                         elif step == "spelling":
                             set_add_user_spelling(text)
-                        else:
-                            set_add_user_gender(text)
+                        elif step == "gender":
+                            handle_gender_choice(text)
                     except AuthenticationError as error:
                         with auth_lock:
                             auth_error = str(error)
                         auth_message()
                         if step == "gender":
+                            auth_prompt_queue.put(
+                                "Please say male, female, non-binary, or prefer not to say."
+                            )
+                        elif step == "spelling":
+                            auth_prompt_queue.put(
+                                "I didn't catch those letters. Say one letter at a time, "
+                                "then say done, or say clear to start over."
+                            )
+                        elif step == "gender":
                             auth_prompt_queue.put(
                                 "Please say male, female, non-binary, or prefer not to say."
                             )
