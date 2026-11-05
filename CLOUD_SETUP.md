@@ -20,6 +20,8 @@ roles. Only the Python server's service key can access these tables.
 If you already created the initial schema, run
 `supabase/migrations/20261105_private_archive.sql` in the SQL Editor before
 starting this version. This adds the archive flag used by hidden discussions.
+Run `supabase/migrations/20261105_user_management_audit.sql` as well to enable
+the admin account-change log.
 
 ## Migrate existing accounts and conversations
 
@@ -47,6 +49,15 @@ and conversation data only through Supabase.
 
 If a Supabase request fails, Jarvis reports the cloud error and does not fall
 back to local persistence.
+
+## Sign-in and adding users
+
+Usernames are matched without regard to letter case. During sign-in, saying
+`admin` selects the `Sunrit` administrator account; spelling a name one letter
+at a time is also accepted. After an administrator enters a new user's name,
+Jarvis asks for its spelling and preferred form of address before enabling PIN
+setup. Both spelling and gender can be spoken or entered in the window. The
+spelling is used to correct speech-recognition mistakes in the entered name.
 
 ## Private discussions and history controls
 

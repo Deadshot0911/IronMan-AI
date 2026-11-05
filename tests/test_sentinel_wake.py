@@ -1,9 +1,12 @@
 import unittest
 
-from sentinel import wake_phrase_matches
+from sentinel import WAKE_COOLDOWN_SECONDS, wake_phrase_matches
 
 
 class WakePhraseTests(unittest.TestCase):
+    def test_shutdown_cooldown_prevents_the_termination_phrase_from_retriggering(self):
+        self.assertGreaterEqual(WAKE_COOLDOWN_SECONDS, 20)
+
     def test_accepts_only_confident_wake_phrases(self):
         self.assertTrue(wake_phrase_matches({
             "text": "hey jarvis",

@@ -15,9 +15,93 @@ from urllib.request import Request, urlopen
 
 DEFAULT_ADMIN_NAME = "Sunrit"
 PIN_PATTERN = re.compile(r"^\d{4,8}$")
+NAME_PREFIX_PATTERN = re.compile(
+    r"^(?:(?:my name is|i am|i'm|this is|spell(?: out)?|the spelling is|"
+    r"it's spelled|it is spelled)\s+)",
+    re.IGNORECASE,
+)
 PBKDF2_ITERATIONS = 240_000
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_SECONDS = 60
+
+
+def normalize_spoken_username(value):
+    if not isinstance(value, str):
+        return ""
+    name = " ".join(value.strip().split())
+    name = NAME_PREFIX_PATTERN.sub("", name).strip()
+    name = name.strip(" \t\r\n.,!?;:")
+    tokens = re.findall(r"[^\W\d_]+", name.casefold(), flags=re.UNICODE)
+    letter_names = {
+        "ay": "a", "a": "a", "bee": "b", "be": "b", "b": "b",
+        "see": "c", "sea": "c", "cee": "c", "c": "c", "dee": "d", "d": "d",
+        "ee": "e", "e": "e", "ef": "f", "eff": "f", "f": "f",
+        "gee": "g", "g": "g", "aitch": "h", "h": "h",
+        "eye": "i", "i": "i", "jay": "j", "j": "j", "kay": "k", "k": "k",
+        "el": "l", "ell": "l", "l": "l", "em": "m", "m": "m",
+        "en": "n", "n": "n", "oh": "o", "o": "o", "pee": "p", "p": "p",
+        "cue": "q", "queue": "q", "q": "q", "are": "r", "ar": "r", "r": "r",
+        "ess": "s", "s": "s", "tee": "t", "t": "t", "you": "u", "u": "u",
+        "vee": "v", "v": "v", "double": "", "w": "w", "ex": "x", "x": "x",
+        "why": "y", "y": "y", "zee": "z", "zed": "z", "z": "z",
+    }
+    spelled_tokens = []
+    index = 0
+    while index < len(tokens):
+        if tokens[index:index + 2] == ["double", "you"]:
+            spelled_tokens.append("w")
+            index += 2
+        else:
+            spelled_tokens.append(tokens[index])
+            index += 1
+    tokens = spelled_tokens
+    if len(tokens) > 1 and all(token in letter_names for token in tokens):
+        return "".join(letter_names[token] for token in tokens)
+    return name
+
+
+def normalize_login_username(value, admin_name=DEFAULT_ADMIN_NAME):
+    username = normalize_spoken_username(value)
+    if username.casefold() == "admin":
+        return admin_name
+    return username
+
+
+def normalize_gender(value):
+    normalized = normalize_spoken_username(value).casefold().replace("-", " ")
+    normalized = re.sub(r"^(?:a|an)\s+", "", normalized)
+    normalized = " ".join(normalized.split())
+    choices = {
+        "male": ("male", "man", "boy", "masculine", "he", "him"),
+        "female": ("female", "woman", "girl", "feminine", "she", "her"),
+        "non_binary": ("non binary", "nonbinary", "they", "them"),
+        "prefer_not_to_say": (
+            "prefer not to say",
+            "rather not say",
+            "skip",
+            "no preference",
+        ),
+    }
+    for gender, aliases in choices.items():
+        if normalized == gender.replace("_", " ") or normalized in aliases:
+            return gender
+    raise AuthenticationError(
+        "Choose male, female, non-binary, or prefer not to say."
+    )
+
+
+def username_from_spelling(name, spelling):
+    initial_name = normalize_spoken_username(name)
+    spelled_name = normalize_spoken_username(spelling)
+    if not spelled_name:
+        raise AuthenticationError("Please spell the new user's name.")
+
+    def compact(value):
+        return "".join(character for character in value.casefold() if character.isalnum())
+
+    if initial_name and compact(initial_name) == compact(spelled_name):
+        return initial_name
+    return spelled_name.title()
 
 
 class AuthenticationError(Exception):
@@ -62,6 +146,12 @@ class AuthStore:
                     memory_enabled INTEGER NOT NULL DEFAULT 0 CHECK (memory_enabled IN (0, 1)),
                     memory_json TEXT NOT NULL DEFAULT '[]',
                     gender TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS user_events (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK (action IN ('disabled', 'enabled', 'deleted')),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -198,12 +288,19 @@ class AuthStore:
             raise AuthenticationError(failure)
         return user
 
-    def add_user(self, actor_id, username, pin):
+    def add_user(self, actor_id, username, pin, gender=None):
         name = username.strip() if isinstance(username, str) else ""
         if not name or len(name) > 60:
             raise AuthenticationError("Enter a name between 1 and 60 characters.")
         if any(ord(char) < 32 for char in name):
             raise AuthenticationError("The username contains unsupported characters.")
+        if gender is not None and gender not in (
+            "male",
+            "female",
+            "non_binary",
+            "prefer_not_to_say",
+        ):
+            raise AuthenticationError("Choose one of the available gender options.")
         self.validate_pin(pin)
 
         salt = secrets.token_bytes(16)
@@ -216,9 +313,9 @@ class AuthStore:
                 raise AuthenticationError("Only the signed-in administrator can add users.")
             try:
                 cursor = connection.execute(
-                    "INSERT INTO users (username, role, pin_salt, pin_hash) "
-                    "VALUES (?, 'user', ?, ?)",
-                    (name, salt, pin_hash),
+                    "INSERT INTO users (username, role, pin_salt, pin_hash, gender) "
+                    "VALUES (?, 'user', ?, ?, ?)",
+                    (name, salt, pin_hash, gender),
                 )
             except sqlite3.IntegrityError as error:
                 raise AuthenticationError("That username is already in use.") from error
@@ -236,7 +333,7 @@ class AuthStore:
             if actor is None or actor["role"] != "admin" or not actor["active"]:
                 raise AuthenticationError("Only the signed-in administrator can manage users.")
             target = connection.execute(
-                "SELECT id, role, active FROM users WHERE id = ?", (target_id,)
+                "SELECT id, username, role, active FROM users WHERE id = ?", (target_id,)
             ).fetchone()
             if target is None or not target["active"]:
                 raise AuthenticationError("That active user was not found.")
@@ -245,14 +342,65 @@ class AuthStore:
             connection.execute(
                 "UPDATE users SET active = 0 WHERE id = ?", (target_id,)
             )
+            connection.execute(
+                "INSERT INTO user_events (username, action) VALUES (?, 'disabled')",
+                (target["username"],),
+            )
+
+    def enable_user(self, actor_id, target_id):
+        with self._connect() as connection:
+            actor = connection.execute(
+                "SELECT role, active FROM users WHERE id = ?", (actor_id,)
+            ).fetchone()
+            target = connection.execute(
+                "SELECT id, username, role, active FROM users WHERE id = ?", (target_id,)
+            ).fetchone()
+            if actor is None or actor["role"] != "admin" or not actor["active"]:
+                raise AuthenticationError("Only the signed-in administrator can manage users.")
+            if target is None or target["role"] != "user":
+                raise AuthenticationError("That user was not found.")
+            if target["active"]:
+                raise AuthenticationError("That user is already enabled.")
+            connection.execute("UPDATE users SET active = 1 WHERE id = ?", (target_id,))
+            connection.execute(
+                "INSERT INTO user_events (username, action) VALUES (?, 'enabled')",
+                (target["username"],),
+            )
+
+    def delete_user(self, actor_id, target_id):
+        with self._connect() as connection:
+            actor = connection.execute(
+                "SELECT role, active FROM users WHERE id = ?", (actor_id,)
+            ).fetchone()
+            target = connection.execute(
+                "SELECT id, username, role FROM users WHERE id = ?", (target_id,)
+            ).fetchone()
+            if actor is None or actor["role"] != "admin" or not actor["active"]:
+                raise AuthenticationError("Only the signed-in administrator can manage users.")
+            if target is None or target["role"] != "user":
+                raise AuthenticationError("That user was not found.")
+            connection.execute(
+                "INSERT INTO user_events (username, action) VALUES (?, 'deleted')",
+                (target["username"],),
+            )
+            connection.execute("DELETE FROM messages WHERE user_id = ?", (target_id,))
+            connection.execute("DELETE FROM sessions WHERE user_id = ?", (target_id,))
+            connection.execute("DELETE FROM users WHERE id = ?", (target_id,))
 
     def list_users(self):
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT id, username, role, active, memory_enabled, gender "
-                "FROM users WHERE active = 1 ORDER BY role DESC, username COLLATE NOCASE"
+                "FROM users ORDER BY role DESC, username COLLATE NOCASE"
             ).fetchall()
             return [self._user(row) for row in rows]
+
+    def list_user_events(self):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT username, action, created_at FROM user_events ORDER BY id DESC LIMIT 100"
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def set_gender(self, user_id, gender):
         if gender not in ("male", "female", "non_binary", "prefer_not_to_say"):
@@ -454,6 +602,16 @@ class SupabaseAuthStore:
                 return data, response.headers
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
+            if (
+                table == "jarvis_user_events"
+                and error.code == 404
+                and ("PGRST205" in detail or "Could not find the table" in detail)
+            ):
+                raise RuntimeError(
+                    "Cloud user-change history is not set up. Apply "
+                    "supabase/migrations/20261105_user_management_audit.sql "
+                    "in the Supabase SQL Editor."
+                ) from error
             raise RuntimeError(
                 f"Cloud database request failed ({error.code}): {detail[:500]}"
             ) from error
@@ -563,12 +721,19 @@ class SupabaseAuthStore:
         )
         return self._user(row)
 
-    def add_user(self, actor_id, username, pin):
+    def add_user(self, actor_id, username, pin, gender=None):
         name = username.strip() if isinstance(username, str) else ""
         if not name or len(name) > 60:
             raise AuthenticationError("Enter a name between 1 and 60 characters.")
         if any(ord(char) < 32 for char in name):
             raise AuthenticationError("The username contains unsupported characters.")
+        if gender is not None and gender not in (
+            "male",
+            "female",
+            "non_binary",
+            "prefer_not_to_say",
+        ):
+            raise AuthenticationError("Choose one of the available gender options.")
         AuthStore.validate_pin(pin)
         actor = self.get_user(actor_id)
         if not actor or actor["role"] != "admin" or not actor["active"]:
@@ -583,6 +748,7 @@ class SupabaseAuthStore:
                     "role": "user",
                     "pin_salt": "\\x" + salt.hex(),
                     "pin_hash": "\\x" + AuthStore._derive_pin(pin, salt).hex(),
+                    "gender": gender,
                 },
             )
         except RuntimeError as error:
@@ -600,6 +766,7 @@ class SupabaseAuthStore:
             raise AuthenticationError("That active user was not found.")
         if target["role"] == "admin":
             raise AuthenticationError("The administrator account cannot be disabled.")
+        self.list_user_events()
         self._request(
             "PATCH",
             "jarvis_users",
@@ -610,6 +777,60 @@ class SupabaseAuthStore:
             {"active": False},
             "return=minimal",
         )
+        self._request(
+            "POST",
+            "jarvis_user_events",
+            body={"username": target["username"], "action": "disabled"},
+            prefer="return=minimal",
+        )
+
+    def enable_user(self, actor_id, target_id):
+        actor = self.get_user(actor_id)
+        if not actor or actor["role"] != "admin" or not actor["active"]:
+            raise AuthenticationError("Only the signed-in administrator can manage users.")
+        target = self.get_user(target_id)
+        if not target or target["role"] != "user":
+            raise AuthenticationError("That user was not found.")
+        if target["active"]:
+            raise AuthenticationError("That user is already enabled.")
+        self.list_user_events()
+        self._request(
+            "PATCH",
+            "jarvis_users",
+            [("id", f"eq.{int(target_id)}"), ("role", "eq.user")],
+            {"active": True},
+            "return=minimal",
+        )
+        self._request(
+            "POST",
+            "jarvis_user_events",
+            body={"username": target["username"], "action": "enabled"},
+            prefer="return=minimal",
+        )
+
+    def delete_user(self, actor_id, target_id):
+        actor = self.get_user(actor_id)
+        if not actor or actor["role"] != "admin" or not actor["active"]:
+            raise AuthenticationError("Only the signed-in administrator can manage users.")
+        target = self.get_user(target_id)
+        if not target or target["role"] != "user":
+            raise AuthenticationError("That user was not found.")
+        self.list_user_events()
+        user_filter = [("user_id", f"eq.{int(target_id)}")]
+        self._request(
+            "POST",
+            "jarvis_user_events",
+            body={"username": target["username"], "action": "deleted"},
+            prefer="return=minimal",
+        )
+        self._request("DELETE", "jarvis_messages", user_filter, prefer="return=minimal")
+        self._request("DELETE", "jarvis_sessions", user_filter, prefer="return=minimal")
+        self._request(
+            "DELETE",
+            "jarvis_users",
+            [("id", f"eq.{int(target_id)}"), ("role", "eq.user")],
+            prefer="return=minimal",
+        )
 
     def list_users(self):
         rows, _ = self._request(
@@ -617,11 +838,22 @@ class SupabaseAuthStore:
             "jarvis_users",
             [
                 ("select", "id,username,role,active,memory_enabled,gender"),
-                ("active", "eq.true"),
                 ("order", "role.desc,username_key.asc"),
             ],
         )
         return [self._user(row) for row in rows]
+
+    def list_user_events(self):
+        rows, _ = self._request(
+            "GET",
+            "jarvis_user_events",
+            [
+                ("select", "username,action,created_at"),
+                ("order", "created_at.desc"),
+                ("limit", "100"),
+            ],
+        )
+        return rows
 
     def set_gender(self, user_id, gender):
         if gender not in ("male", "female", "non_binary", "prefer_not_to_say"):

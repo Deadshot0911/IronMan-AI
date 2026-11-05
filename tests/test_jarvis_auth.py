@@ -5,9 +5,45 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import sqlite3
 
-from jarvis_auth import AuthStore, AuthenticationError, LocalChatStore, SupabaseAuthStore
+from jarvis_auth import (
+    AuthStore,
+    AuthenticationError,
+    LocalChatStore,
+    SupabaseAuthStore,
+    normalize_gender,
+    normalize_login_username,
+    normalize_spoken_username,
+    username_from_spelling,
+)
 
 TEST_PIN = "1234"
+
+
+class UsernameNormalizationTests(unittest.TestCase):
+    def test_spoken_names_and_spelled_letters_are_normalized(self):
+        self.assertEqual(normalize_spoken_username("  my name is SUNRIT "), "SUNRIT")
+        self.assertEqual(normalize_spoken_username("S. U. N. R. I. T."), "sunrit")
+        self.assertEqual(normalize_spoken_username("s-u-n-r-i-t"), "sunrit")
+        self.assertEqual(normalize_spoken_username("jay oh aitch en"), "john")
+        self.assertEqual(normalize_spoken_username("double you eye el el"), "will")
+        self.assertEqual(normalize_spoken_username("admin").casefold(), "admin")
+        self.assertEqual(normalize_login_username("A D M I N"), "Sunrit")
+        self.assertEqual(normalize_login_username("s u n r i t").casefold(), "sunrit")
+        self.assertEqual(normalize_gender("I am a woman"), "female")
+        self.assertEqual(normalize_gender("non-binary"), "non_binary")
+        self.assertEqual(normalize_gender("prefer not to say"), "prefer_not_to_say")
+
+    def test_spelling_is_authoritative_and_preserves_a_matching_display_name(self):
+        self.assertEqual(
+            username_from_spelling("sunrit", "S U N R I T"),
+            "sunrit",
+        )
+        self.assertEqual(
+            username_from_spelling("jon", "J O H N"),
+            "John",
+        )
+        with self.assertRaisesRegex(AuthenticationError, "spell"):
+            username_from_spelling("Alex", "")
 
 
 class AuthStoreTests(unittest.TestCase):
@@ -58,6 +94,26 @@ class AuthStoreTests(unittest.TestCase):
             self.store.add_user(user["id"], "Casey", "5678")
         with self.assertRaises(AuthenticationError):
             self.store.disable_user(user["id"], user["id"])
+
+    def test_new_user_gender_is_saved_and_username_lookup_ignores_case(self):
+        admin = self.store.bootstrap_admin(TEST_PIN)
+        user = self.store.add_user(admin["id"], "Alex", "1234", gender="female")
+        self.assertEqual(user["gender"], "female")
+        self.assertEqual(self.store.authenticate("aLeX", "1234")["id"], user["id"])
+
+    def test_user_disable_enable_and_permanent_delete_are_distinct(self):
+        admin = self.store.bootstrap_admin(TEST_PIN)
+        user = self.store.add_user(admin["id"], "Alex", TEST_PIN)
+        self.store.disable_user(admin["id"], user["id"])
+        self.assertEqual(self.store.get_user(user["id"])["active"], False)
+        self.store.enable_user(admin["id"], user["id"])
+        self.assertEqual(self.store.get_user(user["id"])["active"], True)
+        self.store.delete_user(admin["id"], user["id"])
+        self.assertIsNone(self.store.get_user(user["id"]))
+        self.assertEqual(
+            [event["action"] for event in self.store.list_user_events()],
+            ["deleted", "enabled", "disabled"],
+        )
 
     def test_disabling_user_preserves_history_and_blocks_login(self):
         admin = self.store.bootstrap_admin(TEST_PIN)
@@ -212,6 +268,37 @@ class SupabaseAuthStoreTests(unittest.TestCase):
             "memory_enabled": False,
             "memory_json": [],
         })
+
+    def test_cloud_account_actions_check_audit_table_before_mutating(self):
+        store = SupabaseAuthStore(
+            url="https://example.supabase.co",
+            service_role_key="server-secret",
+        )
+        for action, target_active in (
+            (store.disable_user, True),
+            (store.enable_user, False),
+            (store.delete_user, True),
+        ):
+            with self.subTest(action=action.__name__):
+                admin = {"id": 1, "role": "admin", "active": True}
+                target = {
+                    "id": 2,
+                    "role": "user",
+                    "active": target_active,
+                    "username": "Alex",
+                }
+                with (
+                    patch.object(store, "get_user", side_effect=[admin, target]),
+                    patch.object(
+                        store,
+                        "list_user_events",
+                        side_effect=RuntimeError("audit table missing"),
+                    ),
+                    patch.object(store, "_request") as request,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "audit table missing"):
+                        action(1, 2)
+                    request.assert_not_called()
 
 
 if __name__ == "__main__":

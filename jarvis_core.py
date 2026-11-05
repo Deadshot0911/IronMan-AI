@@ -6,6 +6,10 @@ from jarvis_auth import (
     DEFAULT_ADMIN_NAME,
     LocalChatStore,
     SupabaseAuthStore,
+    normalize_login_username,
+    normalize_gender,
+    normalize_spoken_username,
+    username_from_spelling,
 )
 try:
     import numpy as np
@@ -125,6 +129,7 @@ auth_mode = "login"
 auth_username = None
 auth_error = ""
 auth_management = None
+suspended_user_session = None
 auth_prompt_queue = queue.Queue()
 auth_lock = threading.RLock()
 auth_ready = threading.Event()
@@ -165,11 +170,18 @@ def auth_message_dict(error=None, history=None):
     global auth_error
     with auth_lock:
         users = []
+        user_events = []
         if active_user and active_user["role"] == "admin":
             try:
                 users = auth_store.list_users()
+                user_events = auth_store.list_user_events()
             except Exception as cloud_error:
-                auth_error = "Cloud account data could not be loaded."
+                detail = str(cloud_error)
+                auth_error = (
+                    detail
+                    if "Cloud user-change history is not set up." in detail
+                    else "Cloud account data could not be loaded."
+                )
                 print(f"[Cloud account-list error: {cloud_error}]")
         return {
             "action": "auth",
@@ -182,6 +194,7 @@ def auth_message_dict(error=None, history=None):
             "user": dict(active_user) if active_user else None,
             "management": dict(auth_management) if auth_management else None,
             "users": users,
+            "user_events": user_events,
             "error": error if error is not None else auth_error,
             "history": history,
             "active_conversation_id": (
@@ -196,9 +209,79 @@ def auth_message(error=None, history=None):
     payload = auth_message_dict(error, history)
     _broadcast(json.dumps(payload))
 
+def prepare_user_action(operation, target_id):
+    global auth_management, auth_error
+    if not active_user or active_user["role"] != "admin":
+        raise AuthenticationError("Only the administrator can manage users.")
+    if operation not in ("disable", "enable", "delete"):
+        raise AuthenticationError("Choose disable, enable, or delete.")
+    target = auth_store.get_user(int(target_id))
+    if not target or target["role"] != "user":
+        raise AuthenticationError("That user was not found.")
+    if operation == "disable" and not target["active"]:
+        raise AuthenticationError("That user is already disabled.")
+    if operation == "enable" and target["active"]:
+        raise AuthenticationError("That user is already enabled.")
+    with auth_lock:
+        auth_management = {
+            "mode": "user_action",
+            "step": "confirm",
+            "operation": operation,
+            "user_id": target["id"],
+            "username": target["username"],
+        }
+        auth_error = ""
+    auth_message()
+    auth_prompt_queue.put(
+        f"Confirm {operation} for {target['username']} in the window, or say confirm."
+    )
+
+def request_admin_pin():
+    global auth_management, auth_error
+    with auth_lock:
+        if not auth_management or auth_management.get("step") != "confirm":
+            raise AuthenticationError("There is no pending user action to confirm.")
+        auth_management = {**auth_management, "step": "admin_pin"}
+        auth_error = ""
+        if MIC is not None:
+            MIC.set_muted(True)
+    auth_message()
+    auth_prompt_queue.put("Please enter your administrator PIN in the window.")
+
+def perform_user_action(data):
+    global auth_management, auth_error
+    if not active_user or active_user["role"] != "admin":
+        raise AuthenticationError("Only the administrator can manage users.")
+    if not auth_management or auth_management.get("step") != "admin_pin":
+        raise AuthenticationError("Confirm the action before entering the administrator PIN.")
+    auth_store.authenticate(
+        active_user["username"],
+        data.get("admin_pin", ""),
+        require_admin=True,
+    )
+    target_id = int(auth_management["user_id"])
+    username = auth_management["username"]
+    operation = auth_management["operation"]
+    if operation == "disable":
+        auth_store.disable_user(active_user["id"], target_id)
+        message = f"{username} was disabled. Their history was kept."
+    elif operation == "enable":
+        auth_store.enable_user(active_user["id"], target_id)
+        message = f"{username} was enabled."
+    else:
+        auth_store.delete_user(active_user["id"], target_id)
+        message = f"{username} and their history were permanently deleted."
+    with auth_lock:
+        auth_management = None
+        auth_error = message
+        if MIC is not None:
+            MIC.set_muted(silent)
+    auth_message()
+    auth_prompt_queue.put(message)
+
 def set_login_username(value):
     global auth_username, auth_mode, auth_error
-    username = re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+    username = normalize_login_username(value)
     if not username or len(username) > 60:
         raise AuthenticationError("Enter a username between 1 and 60 characters.")
     if any(ord(char) < 32 for char in username):
@@ -216,7 +299,7 @@ def set_login_username(value):
 
 def set_add_user_username(value):
     global auth_management, auth_error
-    username = re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+    username = normalize_spoken_username(value)
     if not username or len(username) > 60:
         raise AuthenticationError("Enter a username between 1 and 60 characters.")
     if any(ord(char) < 32 for char in username):
@@ -224,18 +307,78 @@ def set_add_user_username(value):
     with auth_lock:
         if not active_user or active_user["role"] != "admin":
             raise AuthenticationError("Only the signed-in administrator can add users.")
-        if not auth_management or auth_management.get("mode") != "add_user":
+        if (
+            not auth_management
+            or auth_management.get("mode") != "add_user"
+            or auth_management.get("step") != "username"
+        ):
             raise AuthenticationError("There is no new-user form open.")
-        auth_management = {"mode": "add_user", "step": "pin", "username": username}
+        auth_management = {
+            "mode": "add_user",
+            "step": "spelling",
+            "username": username,
+        }
+        auth_error = ""
+    auth_message()
+    set_state("standby")
+    auth_prompt_queue.put(f"Please spell {username}, one letter at a time.")
+
+def set_add_user_spelling(value):
+    global auth_management, auth_error
+    with auth_lock:
+        if not active_user or active_user["role"] != "admin":
+            raise AuthenticationError("Only the signed-in administrator can add users.")
+        if (
+            not auth_management
+            or auth_management.get("mode") != "add_user"
+            or auth_management.get("step") != "spelling"
+        ):
+            raise AuthenticationError("There is no spelling step open.")
+        username = username_from_spelling(auth_management["username"], value)
+        if len(username) > 60 or any(ord(char) < 32 for char in username):
+            raise AuthenticationError("Enter a name between 1 and 60 characters.")
+        auth_management = {
+            "mode": "add_user",
+            "step": "gender",
+            "username": username,
+        }
+        auth_error = ""
+    auth_message()
+    set_state("standby")
+    auth_prompt_queue.put(
+        f"What gender should I use when addressing {username}? "
+        "Say male, female, non-binary, or prefer not to say."
+    )
+
+def set_add_user_gender(value):
+    global auth_management, auth_error
+    gender = normalize_gender(value)
+    with auth_lock:
+        if not active_user or active_user["role"] != "admin":
+            raise AuthenticationError("Only the signed-in administrator can add users.")
+        if (
+            not auth_management
+            or auth_management.get("mode") != "add_user"
+            or auth_management.get("step") != "gender"
+        ):
+            raise AuthenticationError("There is no new-user gender choice open.")
+        auth_management = {
+            **auth_management,
+            "step": "pin",
+            "gender": gender,
+        }
         auth_error = ""
         if MIC is not None:
             MIC.set_muted(True)
     auth_message()
     set_state("standby")
+    auth_prompt_queue.put(
+        f"Gender saved. Enter and confirm the new PIN for {auth_management['username']} in the window."
+    )
 
 def activate_user(user):
     global active_user, active_session_id, active_session_store, private_mode, memory_on, chat_seq, auth_epoch
-    global auth_error, auth_management, auth_username, auth_mode, cloud_memory_snapshot
+    global auth_error, auth_management, auth_username, auth_mode, cloud_memory_snapshot, suspended_user_session
     with auth_lock:
         history = []
         memory_on, saved_memory = auth_store.load_profile(user["id"])
@@ -251,6 +394,7 @@ def activate_user(user):
         recent.clear()
         chat_log.clear()
         auth_management = None
+        suspended_user_session = None
         auth_username = None
         auth_mode = "login" if user.get("gender") else "gender_setup"
         auth_error = ""
@@ -264,6 +408,95 @@ def activate_user(user):
                 "How should I greet you? Choose a gender option or prefer not to say in the window."
             )
     auth_message(history=history)
+    push_conversations()
+    push_state()
+
+def begin_admin_takeover():
+    global active_user, active_session_id, active_session_store, private_mode
+    global cloud_memory_snapshot, auth_mode, auth_username, auth_error
+    global auth_management, auth_epoch, memory_on, suspended_user_session
+    if not active_user or active_user["role"] == "admin":
+        raise AuthenticationError("Admin control is only available from a non-admin session.")
+    if not save_profile():
+        raise RuntimeError(auth_error)
+    suspended_user_session = {
+        "active_user": active_user,
+        "active_session_id": active_session_id,
+        "active_session_store": active_session_store,
+        "private_mode": private_mode,
+        "cloud_memory_snapshot": cloud_memory_snapshot,
+        "memory_on": memory_on,
+        "stored": list(stored),
+        "recent": list(recent),
+        "chat_log": list(chat_log.items()),
+        "message_save_times": dict(message_save_times),
+        "was_ready": auth_ready.is_set(),
+        "mic_muted": MIC.muted if MIC is not None else False,
+    }
+    auth_ready.clear()
+    auth_epoch += 1
+    if SPK is not None:
+        SPK.stop_now()
+    if MIC is not None:
+        MIC.set_muted(True)
+    active_user = None
+    active_session_id = None
+    active_session_store = "cloud"
+    private_mode = False
+    cloud_memory_snapshot = None
+    memory_on = False
+    auth_management = None
+    auth_mode = "admin_takeover"
+    auth_username = DEFAULT_ADMIN_NAME
+    auth_error = ""
+    while not auth_prompt_queue.empty():
+        try:
+            auth_prompt_queue.get_nowait()
+        except queue.Empty:
+            break
+    auth_prompt_queue.put("Admin control requested. Enter the administrator PIN in the window.")
+    set_state("standby")
+    auth_message()
+
+def cancel_admin_takeover():
+    global active_user, active_session_id, active_session_store, private_mode
+    global cloud_memory_snapshot, auth_mode, auth_username, auth_error
+    global auth_epoch, memory_on, suspended_user_session
+    if auth_mode != "admin_takeover" or suspended_user_session is None:
+        raise AuthenticationError("There is no paused user session to resume.")
+    session = suspended_user_session
+    suspended_user_session = None
+    active_user = session["active_user"]
+    active_session_id = session["active_session_id"]
+    active_session_store = session["active_session_store"]
+    private_mode = session["private_mode"]
+    cloud_memory_snapshot = session["cloud_memory_snapshot"]
+    memory_on = session["memory_on"]
+    stored[:] = session["stored"]
+    recent[:] = session["recent"]
+    chat_log.clear()
+    chat_log.update(session["chat_log"])
+    message_save_times.clear()
+    message_save_times.update(session["message_save_times"])
+    auth_mode = "login"
+    auth_username = None
+    auth_error = ""
+    auth_epoch += 1
+    while not auth_prompt_queue.empty():
+        try:
+            auth_prompt_queue.get_nowait()
+        except queue.Empty:
+            break
+    if session["was_ready"]:
+        auth_ready.set()
+    if MIC is not None:
+        MIC.set_muted(session["mic_muted"])
+    auth_message(
+        history=[
+            {"id": message_id, "from": sender, "text": text}
+            for message_id, (sender, text) in session["chat_log"]
+        ]
+    )
     push_conversations()
     push_state()
 
@@ -570,7 +803,12 @@ def handle_auth_action(data):
     action = data.get("do")
     try:
         if action == "close_app":
-            close_jarvis()
+            if auth_mode == "admin_takeover" and suspended_user_session:
+                cancel_admin_takeover()
+            else:
+                close_jarvis()
+        elif action == "cancel_admin_takeover":
+            cancel_admin_takeover()
         elif action == "bootstrap":
             if active_user or auth_store.has_admin():
                 raise AuthenticationError("Administrator setup is already complete.")
@@ -649,52 +887,70 @@ def handle_auth_action(data):
         elif action == "open_add_user":
             if not active_user or active_user["role"] != "admin":
                 raise AuthenticationError("Only the signed-in administrator can add users.")
-            name = data.get("username", "")
+            name = normalize_spoken_username(data.get("username", ""))
             with auth_lock:
                 auth_management = {
                     "mode": "add_user",
-                    "step": "pin" if name.strip() else "username",
+                    "step": "spelling" if name else "username",
                     "username": name[:60],
                 }
                 auth_error = ""
             auth_message()
-            if name.strip():
-                auth_prompt_queue.put(
-                    f"I heard {name.strip()}. Enter and confirm the new PIN in the window."
-                )
+            if name:
+                auth_prompt_queue.put(f"Please spell {name}, one letter at a time.")
             else:
                 auth_prompt_queue.put("What's the new user's name? Say it, or type it in the window.")
         elif action == "set_add_username":
             set_add_user_username(data.get("username", ""))
+        elif action == "set_add_spelling":
+            set_add_user_spelling(data.get("spelling", ""))
+        elif action == "set_add_gender":
+            set_add_user_gender(data.get("gender", ""))
         elif action == "add_user":
             if not active_user or active_user["role"] != "admin":
                 raise AuthenticationError("Only the signed-in administrator can add users.")
+            if (
+                not auth_management
+                or auth_management.get("mode") != "add_user"
+                or auth_management.get("step") != "pin"
+            ):
+                raise AuthenticationError("Complete the name and gender steps before setting a PIN.")
             user = auth_store.add_user(
                 active_user["id"],
-                (auth_management or {}).get("username") or data.get("username", ""),
+                auth_management["username"],
                 data.get("pin", ""),
+                gender=auth_management["gender"],
+            )
+            title = {
+                "male": "Sir",
+                "female": "Ma'am",
+                "non_binary": user["username"],
+                "prefer_not_to_say": user["username"],
+            }[user["gender"]]
+            confirmation = (
+                f"{user['username']} was added. Welcome, {title}. "
+                "Your account is ready whenever you want to sign in."
             )
             with auth_lock:
                 auth_management = None
-                auth_error = f"{user['username']} was added."
+                auth_error = confirmation
                 if MIC is not None:
                     MIC.set_muted(silent)
             auth_message()
+            auth_prompt_queue.put(confirmation)
         elif action == "open_delete_user":
             if not active_user or active_user["role"] != "admin":
                 raise AuthenticationError("Only the signed-in administrator can manage users.")
             with auth_lock:
-                auth_management = {"mode": "delete_user"}
+                auth_management = {"mode": "users"}
                 auth_error = ""
             auth_message()
-        elif action == "delete_user":
-            if not active_user or active_user["role"] != "admin":
-                raise AuthenticationError("Only the signed-in administrator can manage users.")
-            auth_store.disable_user(active_user["id"], int(data.get("user_id")))
-            with auth_lock:
-                auth_management = None
-                auth_error = "The user was disabled. Their saved history was retained."
-            auth_message()
+        elif action == "prepare_user_action":
+            prepare_user_action(data.get("operation", ""), data.get("user_id"))
+        elif action == "confirm_user_action":
+            request_admin_pin()
+        elif action == "manage_user":
+            perform_user_action(data)
         elif action == "close_management":
             with auth_lock:
                 auth_management = None
@@ -1267,15 +1523,20 @@ CLOSE_REQUEST = re.compile(
 )
 ADMIN_TAKEOVER_REQUEST = re.compile(
     r"\b(?:jarvis[\s,:-]+)?admin[\s,:-]+taking[\s,:-]+control\b|"
-    r"\badmin[\s,:-]+take[\s,:-]+control\b",
+    r"\badmin[\s,:-]+take[\s,:-]+control\b|"
+    r"\b(?:switch|witch|change)\s+(?:the\s+)?(?:current\s+)?"
+    r"(?:user\s+)?(?:over\s+)?to\s+admin\b|"
+    r"\b(?:switch|change)\s+(?:the\s+)?admin\s+user\b",
     re.IGNORECASE,
 )
 ADD_USER_REQUEST = re.compile(
     r"\badd\s+(?:a\s+)?new\s+user(?:\s+(?:named|called)\s+([^.!?]+))?",
     re.IGNORECASE,
 )
-DELETE_USER_REQUEST = re.compile(
-    r"\b(?:delete|remove|disable)\s+(?:the\s+)?user(?:\s+(.+?))?[.!?]*$",
+USER_ACTION_REQUEST = re.compile(
+    r"\b(?P<operation>permanently\s+delete|delete|disable|enable|restore)\s+"
+    r"(?:the\s+|a\s+)?(?:user|account)"
+    r"(?:\s+(?:named|called)\s+)?(?:\s+(?P<username>.+?))?[.!?]*$",
     re.IGNORECASE,
 )
 DEEP_REQUEST = re.compile(
@@ -1620,18 +1881,65 @@ def handle(text, source):
     global auth_management, auth_error
     if source == "voice" and (silent or not online) and len(text.split()) > 15:
         set_state(ready_state()); return None
+    if (
+        active_user
+        and active_user["role"] == "admin"
+        and auth_management
+        and auth_management.get("mode") == "user_action"
+        and auth_management.get("step") == "confirm"
+        and re.fullmatch(r"\s*(?:yes|confirm|confirmed|do it)[.! ]*\s*", text, re.I)
+    ):
+        if source == "voice":
+            push_chat(new_id(), "you", text)
+        request_admin_pin()
+        return None
     private_on = bool(PRIVATE_ON_REQUEST.search(text))
     if source == "text" and not private_on:
         push_chat(new_id(), "you", text)
         set_state("processing")
     takeover = ADMIN_TAKEOVER_REQUEST.search(text)
     if takeover:
+        if active_user and active_user["role"] == "admin":
+            return reply_text("You're already signed in as the administrator.", source)
+        if not active_user:
+            return reply_text("There isn't an active user session to switch from.", source)
         if source == "voice":
             push_chat(new_id(), "you", text)
-        end_user_session("admin_takeover")
+        begin_admin_takeover()
         if mini:
             act_maximize()
+        return None
+    user_action = USER_ACTION_REQUEST.search(text)
+    if user_action:
+        if not active_user or active_user["role"] != "admin":
+            return reply_text("Only the administrator can manage users.", source)
+        if source == "voice":
+            push_chat(new_id(), "you", text)
+        operation = user_action.group("operation").lower()
+        operation = "delete" if "delete" in operation else (
+            "enable" if operation in ("enable", "restore") else operation
+        )
+        requested_name = (user_action.group("username") or "").strip()
+        if requested_name:
+            matches = [
+                user for user in auth_store.list_users()
+                if user["role"] == "user"
+                and user["username"].casefold() == requested_name.casefold()
+            ]
+            if len(matches) == 1:
+                prepare_user_action(operation, matches[0]["id"])
+                return None
+        with auth_lock:
+            auth_management = {"mode": "users", "operation": operation}
+            auth_error = (
+                f"No user named {requested_name} was found."
+                if requested_name else ""
+            )
         auth_message()
+        auth_prompt_queue.put(
+            "Choose a user and action in the window."
+            if not requested_name else "I couldn't find that user. Choose an account in the window."
+        )
         return None
     add_user = ADD_USER_REQUEST.search(text)
     if add_user:
@@ -1648,17 +1956,6 @@ def handle(text, source):
             auth_error = ""
         auth_message()
         return reply_text("What's the new user's name? Say it, or type it in the window.", source)
-    delete_user = DELETE_USER_REQUEST.search(text)
-    if delete_user:
-        if not active_user or active_user["role"] != "admin":
-            return reply_text("Only the administrator can manage users.", source)
-        if source == "voice":
-            push_chat(new_id(), "you", text)
-        with auth_lock:
-            auth_management = {"mode": "delete_user"}
-            auth_error = ""
-        auth_message()
-        return reply_text("Choose the account to disable.", source)
     if private_on or PRIVATE_OFF_REQUEST.search(text):
         enabled = private_on
         if enabled != private_mode:
@@ -1787,29 +2084,36 @@ def jarvis_brain():
         pending = None
         while auth_ready.is_set():
             if auth_management and auth_management.get("mode") == "add_user":
-                if auth_management.get("step") != "username":
-                    time.sleep(0.1)
-                    continue
                 try:
                     prompt = auth_prompt_queue.get_nowait()
                 except queue.Empty:
                     prompt = None
                 if prompt:
                     speak_auth_prompt(prompt)
+                step = auth_management.get("step")
+                if step not in ("username", "spelling"):
+                    time.sleep(0.1)
+                    continue
                 if MIC is None:
                     time.sleep(0.1)
                     continue
                 text = listen_fast()
                 if text and auth_ready.is_set():
                     try:
-                        set_add_user_username(text)
-                        speak_auth_prompt(
-                            f"I heard {auth_management['username']}. Enter and confirm the new PIN in the window."
-                        )
+                        if step == "username":
+                            set_add_user_username(text)
+                        elif step == "spelling":
+                            set_add_user_spelling(text)
+                        else:
+                            set_add_user_gender(text)
                     except AuthenticationError as error:
                         with auth_lock:
                             auth_error = str(error)
                         auth_message()
+                        if step == "gender":
+                            auth_prompt_queue.put(
+                                "Please say male, female, non-binary, or prefer not to say."
+                            )
                 continue
             try:
                 prompt = auth_prompt_queue.get_nowait()

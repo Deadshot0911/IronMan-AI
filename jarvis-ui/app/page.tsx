@@ -32,7 +32,8 @@ const RED = "#ff5470";
 const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
 type Msg = { id: number | string; from: "jarvis" | "you"; text: string };
-type AuthUser = { id: number; username: string; role: "admin" | "user"; gender?: string | null };
+type AuthUser = { id: number; username: string; role: "admin" | "user"; active: boolean; gender?: string | null };
+type UserEvent = { username: string; action: "disabled" | "enabled" | "deleted"; created_at: string };
 type AuthState = {
   ready: boolean;
   required: boolean;
@@ -41,8 +42,9 @@ type AuthState = {
   admin_name: string;
   login_username?: string | null;
   user: AuthUser | null;
-  management: { mode: string; step?: string; username?: string } | null;
+  management: { mode: string; step?: string; username?: string; operation?: string; user_id?: number } | null;
   users: AuthUser[];
+  user_events: UserEvent[];
   error: string;
   history?: Msg[] | null;
   active_conversation_id?: number | string | null;
@@ -118,9 +120,9 @@ function AuthScreen({
     >
       <button
         type="button"
-        onClick={close}
-        aria-label="Close Jarvis"
-        title="Close Jarvis"
+        onClick={() => isTakeover ? send({ do: "cancel_admin_takeover" }) : close()}
+        aria-label={isTakeover ? "Return to current user session" : "Close Jarvis"}
+        title={isTakeover ? "Return to current user session" : "Close Jarvis"}
         style={{
           position: "fixed",
           top: 24,
@@ -159,7 +161,7 @@ function AuthScreen({
           {isSetup
             ? `Create the ${auth.admin_name} administrator account. Choose a 4–8 digit PIN.`
             : isTakeover
-            ? "The previous session has been saved. Enter the administrator PIN to take control."
+            ? "The current user session is paused. Enter the administrator PIN to switch, or close this window to resume it."
             : pinStep
             ? "Enter your PIN in this private sign-in window."
             : "Say your username, or type it below. Jarvis will ask for your PIN here."}
@@ -236,6 +238,15 @@ function AuthScreen({
         <button type="submit" style={authPrimaryButton}>
           {isSetup ? "CREATE ADMIN ACCOUNT" : isTakeover ? "VERIFY ADMIN PIN" : pinStep ? "UNLOCK SESSION" : "CONFIRM USERNAME"}
         </button>
+        {isTakeover && (
+          <button
+            type="button"
+            onClick={() => send({ do: "cancel_admin_takeover" })}
+            style={{ ...authSecondaryButton, width: "100%", marginTop: 10 }}
+          >
+            RETURN TO CURRENT SESSION
+          </button>
+        )}
       </form>
     </main>
   );
@@ -411,14 +422,20 @@ function UserManagementDialog({
   auth: AuthState;
   send: (data: object) => void;
 }) {
-  const [username, setUsername] = useState(auth.management?.username || "");
+  const [username, setUsername] = useState(
+    auth.management?.step === "username" ? auth.management.username || "" : "",
+  );
   const [pin, setPin] = useState("");
   const [confirmation, setConfirmation] = useState("");
-  const [target, setTarget] = useState<AuthUser | null>(null);
+  const [adminPin, setAdminPin] = useState("");
 
   if (!auth.management) return null;
   const adding = auth.management.mode === "add_user";
-  const usernameStep = adding && auth.management.step !== "pin";
+  const managing = auth.management.mode === "users";
+  const userAction = auth.management.mode === "user_action";
+  const usernameStep = adding && auth.management.step === "username";
+  const spellingStep = adding && auth.management.step === "spelling";
+  const genderStep = adding && auth.management.step === "gender";
 
   const addUser = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -426,6 +443,11 @@ function UserManagementDialog({
       send({ do: "set_add_username", username: username.trim() });
       return;
     }
+    if (spellingStep) {
+      send({ do: "set_add_spelling", spelling: username.trim() });
+      return;
+    }
+    if (genderStep) return;
     if (pin !== confirmation) {
       setConfirmation("");
       return;
@@ -434,6 +456,13 @@ function UserManagementDialog({
     setPin("");
     setConfirmation("");
   };
+  const confirmUserAction = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    send({ do: "manage_user", admin_pin: adminPin });
+    setAdminPin("");
+  };
+  const prepareAction = (user: AuthUser, operation: "disable" | "enable" | "delete") =>
+    send({ do: "prepare_user_action", user_id: user.id, operation });
 
   return (
     <div
@@ -472,8 +501,8 @@ function UserManagementDialog({
             ? "PERMANENTLY DELETE HISTORY?"
             : adding
             ? "ADD A USER"
-            : target
-            ? "DISABLE ACCOUNT?"
+            : userAction
+            ? auth.management.step === "admin_pin" ? "ADMIN PIN REQUIRED" : "CONFIRM USER ACTION"
             : "MANAGE USERS"}
         </h2>
         <p style={{ margin: "0 0 18px", color: "rgba(190,239,255,0.65)", fontSize: 12, lineHeight: 1.6 }}>
@@ -482,10 +511,16 @@ function UserManagementDialog({
             : adding
             ? usernameStep
               ? "Say the new user's name, or type it below. PINs are entered only here."
+              : spellingStep
+              ? `Say ${auth.management.username}'s spelling one letter at a time, or type it below.`
+              : genderStep
+              ? `Say ${auth.management.username}'s gender, or choose an option below.`
               : "Choose and confirm a 4–8 digit PIN. Their conversation history will be separate."
-            : target
-            ? `${target.username}'s account will be disabled. Their saved history will be retained.`
-            : "Disabled accounts cannot sign in. Their saved history is retained."}
+            : userAction
+            ? auth.management.step === "admin_pin"
+              ? `Enter your administrator PIN to ${auth.management.operation} ${auth.management.username}.`
+              : `Say “confirm” or press Confirm to ${auth.management.operation} ${auth.management.username}. This action requires your administrator PIN.`
+            : "Review active, disabled, and recently deleted accounts. Delete permanently removes that user's account and history."}
         </p>
         {auth.management.mode === "permanently_delete_history" ? (
           <div style={{ display: "flex", gap: 10 }}>
@@ -501,9 +536,9 @@ function UserManagementDialog({
           </div>
         ) : adding ? (
           <form onSubmit={addUser}>
-            {usernameStep ? (
+            {usernameStep || spellingStep ? (
               <label style={authLabel}>
-                USERNAME
+                {usernameStep ? "USERNAME" : "SPELL THE USERNAME"}
                 <input
                   autoFocus
                   autoComplete="off"
@@ -511,13 +546,33 @@ function UserManagementDialog({
                   required
                   value={username}
                   onChange={(event) => setUsername(event.target.value)}
+                  placeholder={spellingStep ? "Type the corrected spelling" : "Enter the user's name"}
                   style={authInput}
                 />
               </label>
             ) : (
               <div style={{ ...authInput, marginBottom: 14 }}>{auth.management.username}</div>
             )}
-            {!usernameStep && (
+            {genderStep && (
+              <div style={{ display: "grid", gap: 8, marginBottom: 14 }}>
+                {[
+                  ["male", "MALE"],
+                  ["female", "FEMALE"],
+                  ["non_binary", "NON-BINARY"],
+                  ["prefer_not_to_say", "PREFER NOT TO SAY"],
+                ].map(([gender, label]) => (
+                  <button
+                    key={gender}
+                    type="button"
+                    onClick={() => send({ do: "set_add_gender", gender })}
+                    style={authSecondaryButton}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+            {adding && auth.management.step === "pin" && (
               <>
                 <label style={authLabel}>
                   NEW USER PIN
@@ -555,35 +610,77 @@ function UserManagementDialog({
               </>
             )}
             {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
-            <button type="submit" style={authPrimaryButton}>
-              {usernameStep ? "CONFIRM USERNAME" : "SAVE USER"}
-            </button>
+            {!genderStep && (
+              <button type="submit" style={authPrimaryButton}>
+                {usernameStep ? "CONTINUE TO SPELLING" : spellingStep ? "CONFIRM SPELLING" : "SAVE USER"}
+              </button>
+            )}
           </form>
-        ) : target ? (
+        ) : userAction && auth.management.step === "confirm" ? (
           <div style={{ display: "flex", gap: 10 }}>
-            <button onClick={() => setTarget(null)} style={authSecondaryButton}>CANCEL</button>
-            <button onClick={() => send({ do: "delete_user", user_id: target.id })} style={authDangerButton}>
-              DISABLE USER
+            <button onClick={() => send({ do: "close_management" })} style={authSecondaryButton}>CANCEL</button>
+            <button onClick={() => send({ do: "confirm_user_action" })} style={authDangerButton}>
+              CONFIRM
             </button>
           </div>
-        ) : (
+        ) : userAction && auth.management.step === "admin_pin" ? (
+          <form onSubmit={confirmUserAction}>
+            <label style={authLabel}>
+              ADMINISTRATOR PIN
+              <input
+                autoFocus
+                autoComplete="current-password"
+                inputMode="numeric"
+                maxLength={8}
+                minLength={4}
+                pattern="[0-9]{4,8}"
+                required
+                type="password"
+                value={adminPin}
+                onChange={(event) => setAdminPin(event.target.value.replace(/\D/g, "").slice(0, 8))}
+                style={authInput}
+              />
+            </label>
+            {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+            <button type="submit" style={authDangerButton}>AUTHORIZE ACTION</button>
+          </form>
+        ) : managing || userAction ? (
           <div style={{ display: "grid", gap: 8, maxHeight: "42vh", overflowY: "auto" }}>
             {auth.users.filter((user) => user.role === "user").map((user) => (
-              <button
-                key={user.id}
-                onClick={() => setTarget(user)}
-                style={authSecondaryButton}
-              >
-                DISABLE · {user.username}
-              </button>
+              <div key={user.id} style={{ ...authInput, display: "grid", gap: 8 }}>
+                <span>{user.username} · {user.active ? "ACTIVE" : "DISABLED"}</span>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {user.active ? (
+                    <>
+                      <button type="button" onClick={() => prepareAction(user, "disable")} style={authSecondaryButton}>DISABLE</button>
+                      <button type="button" onClick={() => prepareAction(user, "delete")} style={authDangerButton}>DELETE PERMANENTLY</button>
+                    </>
+                  ) : (
+                    <>
+                      <button type="button" onClick={() => prepareAction(user, "enable")} style={authPrimaryButton}>ENABLE</button>
+                      <button type="button" onClick={() => prepareAction(user, "delete")} style={authDangerButton}>DELETE PERMANENTLY</button>
+                    </>
+                  )}
+                </div>
+              </div>
             ))}
             {auth.users.every((user) => user.role !== "user") && (
               <p style={{ color: "rgba(190,239,255,0.58)", fontSize: 12 }}>No regular accounts have been added.</p>
             )}
+            {auth.user_events.length > 0 && (
+              <div style={{ marginTop: 8, borderTop: "1px solid rgba(34,229,255,0.14)", paddingTop: 8 }}>
+                <strong style={{ fontSize: 11 }}>RECENT ACCOUNT CHANGES</strong>
+                {auth.user_events.map((event, index) => (
+                  <p key={`${event.username}-${event.created_at}-${index}`} style={{ margin: "6px 0", color: "rgba(190,239,255,0.62)", fontSize: 11 }}>
+                    {event.username} · {event.action.toUpperCase()} · {new Date(event.created_at).toLocaleString()}
+                  </p>
+                ))}
+              </div>
+            )}
             {auth.error && <p role="status" style={{ color: CYAN, fontSize: 12 }}>{auth.error}</p>}
           </div>
-        )}
-        {!adding && auth.error && !target && (
+        ) : null}
+        {!adding && auth.error && (
           <p role="status" style={{ color: CYAN, fontSize: 12 }}>{auth.error}</p>
         )}
         <button
@@ -902,6 +999,7 @@ export default function JarvisUI() {
     user: null,
     management: null,
     users: [],
+    user_events: [],
     error: "",
   });
   const [isListening, setIsListening] = useState(false);
@@ -1971,7 +2069,7 @@ export default function JarvisUI() {
       </AnimatePresence>
     </div>
     <UserManagementDialog
-      key={`${auth.management?.mode || ""}-${auth.management?.username || ""}`}
+      key={`${auth.management?.mode || ""}-${auth.management?.step || ""}-${auth.management?.username || ""}`}
       auth={auth}
       send={authSend}
     />

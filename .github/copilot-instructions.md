@@ -29,7 +29,7 @@ Start_Jarvis.bat
 Start_Sentinel.bat
 ```
 
-Run `Install_Jarvis_Startup.bat` once to add the hidden wake listener to the current Windows account's Startup folder. After signing in, say "Jarvis" to start the production UI and assistant together. The bundled `vosk-model-small/` is required for offline wake detection. Closing Jarvis from the window controls or by saying/typing "Jarvis, terminate" closes the app and its UI server; the independent wake listener stays active and can relaunch it.
+Run `Install_Jarvis_Startup.bat` once to add the hidden wake listener to the current Windows account's Startup folder. The installer removes the legacy non-interactive `Jarvis Sentinel` scheduled task, which cannot open Jarvis's desktop window. After signing in, say "Jarvis" to start the production UI and assistant together. The bundled `vosk-model-small/` is required for offline wake detection. Closing Jarvis from the window controls or by saying/typing "Jarvis, terminate" closes the app and its UI server; the independent wake listener stays active and can relaunch it.
 
 The frameless Jarvis window should use the Windows work area rather than cover the taskbar. Keep the minimize and close controls available in both expanded and minimized UI states.
 
