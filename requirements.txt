@@ -1,0 +1,30 @@
+# Core runtime
+numpy
+sounddevice
+soundfile
+requests
+websockets
+pywebview
+python-dotenv
+google-genai
+groq
+kokoro
+torch
+webrtcvad-wheels
+vosk
+beautifulsoup4
+
+# Windows laptop control
+pywin32
+pillow
+
+# WhatsApp reading/replies and on-screen actions
+uiautomation
+pyautogui
+pyperclip
+mss
+
+# Google Calendar
+google-api-python-client
+google-auth
+google-auth-oauthlib

@@ -567,9 +567,13 @@ class AuthStore:
 
 class SupabaseAuthStore:
     def __init__(self, url=None, service_role_key=None, timeout=15):
-        self.url = (url or os.getenv("SUPABASE_URL", "")).rstrip("/")
-        self.service_role_key = service_role_key or os.getenv(
-            "SUPABASE_SERVICE_ROLE_KEY", ""
+        self.url = (
+            os.getenv("SUPABASE_URL", "") if url is None else str(url)
+        ).rstrip("/")
+        self.service_role_key = (
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+            if service_role_key is None
+            else str(service_role_key)
         )
         self.timeout = timeout
         if not self.url or not self.service_role_key:

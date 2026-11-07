@@ -53,6 +53,37 @@ type AuthState = {
   users: AuthUser[];
   user_events: UserEvent[];
   error: string;
+  pending_action?: {
+    stage: string;
+    label: string;
+    source?: string;
+    draft?: {
+      kind: string;
+      to?: string;
+      display_to?: string;
+      subject?: string;
+      body?: string;
+      phone?: string;
+      message?: string;
+    };
+    warning?: string;
+    command?: string;
+    screen_plan?: {
+      summary?: string;
+      answer?: string;
+      instruction?: string;
+      screenshot?: string;
+      actions?: Array<{
+        type?: string;
+        description?: string;
+        x?: number;
+        y?: number;
+        text?: string;
+        key?: string;
+        keys?: string[];
+      }>;
+    };
+  } | null;
   history?: Msg[] | null;
   active_conversation_id?: number | string | null;
   private_mode?: boolean;
@@ -739,6 +770,192 @@ function UserManagementDialog({
         >
           CLOSE
         </button>
+      </section>
+    </div>
+  );
+}
+
+function PendingActionDialog({
+  auth,
+  send,
+}: {
+  auth: AuthState;
+  send: (data: object) => void;
+}) {
+  const [pin, setPin] = useState("");
+  const pending = auth.pending_action;
+  if (!pending) return null;
+
+  const draft = pending.draft;
+  const isDraft = pending.stage === "confirm_send";
+  const isDanger = pending.stage === "danger_confirm";
+  const isScreen = pending.stage === "confirm_screen";
+  const kind = draft?.kind === "whatsapp" ? "WHATSAPP MESSAGE" : "EMAIL";
+  const title = pending.stage === "admin_pin"
+    ? "ADMIN AUTHORIZATION REQUIRED"
+    : isDanger
+    ? "CONFIRM DESTRUCTIVE ACTION"
+    : isScreen
+    ? "CONFIRM SCREEN ACTION"
+    : `APPROVE ${kind}`;
+
+  const authorize = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    send({ do: "authorize_action", admin_pin: pin });
+    setPin("");
+  };
+
+  return (
+    <div
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) send({ do: "cancel_pending_action" });
+      }}
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 320,
+        display: "grid",
+        placeItems: "center",
+        padding: 20,
+        background: "rgba(0,4,8,0.78)",
+        backdropFilter: "blur(12px)",
+        fontFamily: MONO,
+      }}
+    >
+      <section
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pending-action-title"
+        style={{
+          width: "min(460px, 100%)",
+          padding: 24,
+          borderRadius: 18,
+          color: "#d4fbff",
+          background: "rgba(8,23,33,0.97)",
+          border: "1px solid rgba(34,229,255,0.34)",
+          boxShadow: "0 0 42px rgba(34,229,255,0.16)",
+        }}
+      >
+        <h2 id="pending-action-title" style={{ margin: "0 0 8px", fontSize: 18 }}>
+          {title}
+        </h2>
+        <p style={{ margin: "0 0 16px", color: "rgba(190,239,255,0.65)", fontSize: 12, lineHeight: 1.6 }}>
+          {pending.stage === "admin_pin"
+            ? `A regular user asked Jarvis to ${pending.label}. Enter the administrator PIN to authorize this one action.`
+            : isDanger
+            ? pending.warning || "This action can change or damage the machine."
+            : isScreen
+            ? "Review the planned clicks and typing. Nothing happens on your screen until you confirm."
+            : `Review the draft, then approve it. Nothing has been sent yet.`}
+        </p>
+
+        {pending.stage === "admin_pin" ? (
+          <form onSubmit={authorize}>
+            <label style={authLabel}>
+              ADMINISTRATOR PIN
+              <input
+                type="password"
+                inputMode="numeric"
+                autoFocus
+                value={pin}
+                onChange={(event) => setPin(event.target.value.replace(/\D/g, "").slice(0, 8))}
+                style={authInput}
+              />
+            </label>
+            {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+            <button type="submit" style={authPrimaryButton}>AUTHORIZE ACTION</button>
+            <button
+              type="button"
+              onClick={() => send({ do: "cancel_pending_action" })}
+              style={{ ...authSecondaryButton, width: "100%", marginTop: 10 }}
+            >
+              CANCEL
+            </button>
+          </form>
+        ) : isDanger ? (
+          <div style={{ display: "grid", gap: 12 }}>
+            {pending.command && (
+              <pre style={{ margin: 0, padding: 12, borderRadius: 10, background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,84,112,0.3)", color: "#ffd7de", whiteSpace: "pre-wrap", wordBreak: "break-word", font: `12px ${MONO}` }}>
+                {pending.command}
+              </pre>
+            )}
+            {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+            <button type="button" onClick={() => send({ do: "confirm_pending_action" })} style={authDangerButton}>
+              CONFIRM DANGEROUS
+            </button>
+            <button type="button" onClick={() => send({ do: "cancel_pending_action" })} style={authSecondaryButton}>
+              CANCEL
+            </button>
+          </div>
+        ) : isScreen ? (
+          <div style={{ display: "grid", gap: 12 }}>
+            <div style={{ display: "grid", gap: 8, padding: 12, borderRadius: 10, background: "rgba(0,0,0,0.26)", border: "1px solid rgba(34,229,255,0.18)" }}>
+              {pending.screen_plan?.summary && (
+                <div style={{ color: "#e5fcff", fontSize: 13, lineHeight: 1.5 }}>
+                  {pending.screen_plan.summary}
+                </div>
+              )}
+              {pending.screen_plan?.instruction && (
+                <div style={{ color: "rgba(190,239,255,0.55)", fontSize: 10, letterSpacing: "0.14em" }}>
+                  INSTRUCTION
+                  <div style={{ color: "#d9fbff", fontSize: 12, letterSpacing: 0, marginTop: 3, lineHeight: 1.5 }}>
+                    {pending.screen_plan.instruction}
+                  </div>
+                </div>
+              )}
+              {(pending.screen_plan?.actions?.length || 0) > 0 ? (
+                <ol style={{ margin: 0, paddingLeft: 18, color: "#d9fbff", fontSize: 12, lineHeight: 1.7 }}>
+                  {pending.screen_plan?.actions?.map((action, index) => (
+                    <li key={`${action.type || "step"}-${index}`}>
+                      {action.description || action.type || "screen action"}
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <div style={{ color: "rgba(190,239,255,0.65)", fontSize: 12 }}>
+                  No steps were planned.
+                </div>
+              )}
+            </div>
+            {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+            <button type="button" onClick={() => send({ do: "confirm_pending_action" })} style={authPrimaryButton}>
+              EXECUTE ON SCREEN
+            </button>
+            <button type="button" onClick={() => send({ do: "cancel_pending_action" })} style={authSecondaryButton}>
+              CANCEL
+            </button>
+          </div>
+        ) : isDraft ? (
+          <div style={{ display: "grid", gap: 12 }}>
+            <div style={{ display: "grid", gap: 8, padding: 12, borderRadius: 10, background: "rgba(0,0,0,0.26)", border: "1px solid rgba(34,229,255,0.18)" }}>
+              <div style={{ color: "rgba(190,239,255,0.55)", fontSize: 10, letterSpacing: "0.14em" }}>
+                TO
+                <div style={{ color: "#e5fcff", fontSize: 13, letterSpacing: 0, marginTop: 3 }}>
+                  {draft?.to} {draft?.phone ? `· ${draft.phone}` : ""}
+                </div>
+              </div>
+              {draft?.kind === "email" && (
+                <div style={{ color: "rgba(190,239,255,0.55)", fontSize: 10, letterSpacing: "0.14em" }}>
+                  SUBJECT
+                  <div style={{ color: "#e5fcff", fontSize: 13, letterSpacing: 0, marginTop: 3 }}>
+                    {draft.subject}
+                  </div>
+                </div>
+              )}
+              <pre style={{ margin: 0, color: "#d9fbff", whiteSpace: "pre-wrap", wordBreak: "break-word", font: `12px/1.6 ${MONO}` }}>
+                {draft?.kind === "email" ? draft.body : draft?.message}
+              </pre>
+            </div>
+            {auth.error && <p role="alert" style={authErrorStyle}>{auth.error}</p>}
+            <button type="button" onClick={() => send({ do: "confirm_pending_action" })} style={authPrimaryButton}>
+              {draft?.kind === "whatsapp" ? "OPEN WHATSAPP WITH MESSAGE" : "SEND EMAIL"}
+            </button>
+            <button type="button" onClick={() => send({ do: "cancel_pending_action" })} style={authSecondaryButton}>
+              CANCEL
+            </button>
+          </div>
+        ) : null}
       </section>
     </div>
   );
@@ -2120,6 +2337,11 @@ export default function JarvisUI() {
     </div>
     <UserManagementDialog
       key={`${auth.management?.mode || ""}-${auth.management?.step || ""}-${auth.management?.username || ""}`}
+      auth={auth}
+      send={authSend}
+    />
+    <PendingActionDialog
+      key={`${auth.pending_action?.stage || ""}-${auth.pending_action?.label || ""}`}
       auth={auth}
       send={authSend}
     />

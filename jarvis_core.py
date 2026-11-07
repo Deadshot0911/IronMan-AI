@@ -12,6 +12,21 @@ from jarvis_auth import (
     normalize_spoken_spelling,
     username_from_spelling,
 )
+from jarvis_action_policy import (
+    describe_action,
+    is_approval_text,
+    is_cancel_text,
+    is_danger_confirmation_text,
+    is_destructive,
+    is_sensitive,
+    requires_approval,
+    requires_screen_confirmation,
+)
+import jarvis_pc
+import jarvis_screen
+import jarvis_services
+import jarvis_whatsapp
+from jarvis_pc import ActionError
 try:
     import numpy as np
     import sounddevice as sd
@@ -45,8 +60,9 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 # ---------- CONFIG ----------
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"]   
 GROQ_MODEL = "openai/gpt-oss-20b"
-ROUTER_MODEL = "llama-3.1-8b-instant"      
+ROUTER_MODEL = GROQ_MODEL
 OLLAMA_MODEL = "llama3"
+PENDING_TIMEOUT = 120
 VOICE = "bm_george"
 FS, FRAME, TTS_SR = 16000, 480, 24000
 END_FRAMES = 17                            
@@ -55,6 +71,7 @@ BARGE_MODE = True
 BARGE_MIN = 0.02
 LEAD = 0.55
 MEM_FILE = "jarvis_memory.json"
+ACTION_LOG = "jarvis_actions.log"
 
 try:
     work_area = wintypes.RECT()
@@ -138,11 +155,26 @@ ui_loaded = threading.Event()
 audio_ready = False
 auth_epoch = 0
 turn_context = threading.local()
+pending_action = None
 
 def new_id():
     global chat_seq
     chat_seq += 1
     return chat_seq
+
+def audit_action(action, result):
+    try:
+        entry = {
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "user": active_user["username"] if active_user else None,
+            "role": active_user["role"] if active_user else None,
+            "action": action,
+            "result": str(result)[:2000],
+        }
+        with open(ACTION_LOG, "a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 # ---------- MEMORY ----------
 memory_on = False
@@ -197,6 +229,7 @@ def auth_message_dict(error=None, history=None):
             "users": users,
             "user_events": user_events,
             "error": error if error is not None else auth_error,
+            "pending_action": pending_public(),
             "history": history,
             "active_conversation_id": (
                 f"private:{active_session_id}"
@@ -458,6 +491,7 @@ def confirm_end_session(data):
 def activate_user(user):
     global active_user, active_session_id, active_session_store, private_mode, memory_on, chat_seq, auth_epoch
     global auth_error, auth_management, auth_username, auth_mode, cloud_memory_snapshot, suspended_user_session
+    global pending_action
     with auth_lock:
         history = []
         memory_on, saved_memory = auth_store.load_profile(user["id"])
@@ -474,6 +508,7 @@ def activate_user(user):
         chat_log.clear()
         auth_management = None
         suspended_user_session = None
+        pending_action = None
         auth_username = None
         auth_mode = "login" if user.get("gender") else "gender_setup"
         auth_error = ""
@@ -581,6 +616,7 @@ def cancel_admin_takeover():
 
 def end_user_session(next_mode="login", error=""):
     global active_user, active_session_id, active_session_store, private_mode, cloud_memory_snapshot, auth_mode, auth_username, auth_error, auth_management, auth_epoch, memory_on, silent
+    global pending_action
     with auth_lock:
         if cloud_memory_snapshot is not None:
             memory_on, saved_memory = cloud_memory_snapshot
@@ -604,6 +640,7 @@ def end_user_session(next_mode="login", error=""):
         active_session_store = "cloud"
         private_mode = False
         memory_on = False
+        pending_action = None
         auth_mode = next_mode
         auth_username = DEFAULT_ADMIN_NAME if next_mode == "admin_takeover" else None
         auth_error = error
@@ -1027,6 +1064,12 @@ def handle_auth_action(data):
                 if MIC is not None:
                     MIC.set_muted(False)
             auth_message()
+        elif action == "authorize_action":
+            authorize_pending_action(data.get("admin_pin", ""))
+        elif action == "confirm_pending_action":
+            confirm_pending_action()
+        elif action == "cancel_pending_action":
+            cancel_pending_action()
         else:
             raise AuthenticationError("That account action is not supported.")
     except (AuthenticationError, TypeError, ValueError, RuntimeError, sqlite3.Error) as error:
@@ -1555,9 +1598,41 @@ Actions:
 {"do":"mode","mode":"text|voice"} open the text chat (answers arrive as text) or go back to voice.
 {"do":"output","mode":"voice|text|auto"} standing preference for HOW answers are delivered: always voice, always text, or auto (match how the user asked).
 
+Laptop and account actions (Jarvis enforces administrator approval separately; always emit the action normally):
+{"do":"open","target":"URL, app, file, or folder"} open something on the laptop.
+{"do":"search","query":"what to search for","open":true,"read":true} search the web in the browser and optionally have Jarvis read the result aloud.
+{"do":"file","action":"open|read|write|append|list|find","target":"file name, folder, or path","content":"text to write","query":"file name to search for"} open, read, write, list, or find files.
+{"do":"app","name":"chrome|notepad|settings|explorer|terminal|word|excel|outlook|whatsapp|..."} launch an app.
+{"do":"shell","command":"exact PowerShell command"} run a command on the laptop.
+{"do":"system","action":"volume_up|volume_down|mute|lock|screenshot|sleep|shutdown|restart|cancel_shutdown|minimize_all|show_desktop|list_windows|activate|close_app|open_settings","target":"window or app name when needed"} control Windows.
+{"do":"email","action":"open|draft|send","to":"address or contact name","subject":"...","body":"full email body"} open Gmail, draft an email, or send one after approval.
+{"do":"whatsapp","to":"phone number or contact name","message":"full message"} draft a WhatsApp message and open the chat after approval.
+{"do":"calendar","action":"open|list|create","days":7,"title":"...","start":"ISO 8601 local time","end":"ISO 8601 local time","description":"...","location":"..."} open, read, or add Google Calendar events.
+{"do":"message","app":"whatsapp|gmail","action":"read|open|conversation|reply","to":"chat or contact name","message":"reply text","subject":"email subject","limit":8} read unread messages, open a chat, read a conversation, or draft a reply. For a WhatsApp reply use the chat name shown by Jarvis; no phone number is needed.
+{"do":"screen","action":"look|act","question":"what to look for","instruction":"what to do on screen"} look at the screen and answer, or prepare clicks/typing on the screen.
+
+Computer-action rules:
+- "open the browser and search X" -> search with open=true. Set read=true when the user asks to hear the result; otherwise false.
+- Open a file by name -> file. Open a folder -> open with the folder as target. Open an app -> app.
+- "run ipconfig" or any command -> shell with exactly what the user asked.
+- "open my email" -> email with action open. "draft an email" -> email with action draft. "send an email" -> email with action send.
+- For email send, write a complete, natural body from the user's instruction. Never invent a recipient. If the user only gives a name, put that name in "to" (Jarvis resolves contacts).
+- "what's on my calendar" -> calendar list with days=1 for today or days=7 for this week. Add an event -> calendar create.
+- "do I have new messages" / "read my messages" -> message with app whatsapp or gmail (use both as two actions when the user says messages without naming an app), action read.
+- "reply to Srija saying I'm on my way" -> message app whatsapp action reply with the chat name the user gave and the full reply in "message". Jarvis drafts it first.
+- "read my chat with Srija" -> message app whatsapp action conversation with to=Srija.
+- "what's on my screen" / "look at my screen" -> screen action look with a question.
+- "click the blue button", "type this in the field", "scroll down and open settings" -> screen action act with the full instruction. Jarvis plans it and asks for confirmation before touching the mouse or keyboard.
+- "read notes.txt" -> file action read. "write meeting notes to notes.txt saying ..." -> file action write with content. "list my Downloads" -> file action list. "find the file called report" -> file action find.
+- Use STATE.now to resolve today/tomorrow. If no time is given, use 09:00 local; if no end is given, use one hour later.
+- For system controls, map "turn up the volume" to volume_up, "lock my laptop" to lock, "take a screenshot" to screenshot, "switch to Chrome" to activate with target Chrome, and "shut down" to shutdown.
+- If a request is unrelated to these actions, use intent "chat" and leave actions empty.
+- Do not reveal or repeat passwords, API keys, or PINs in "reply".
+
 STATE (given with each input) describes the situation:
 - online=false: Jarvis is offline. Only honour requests that bring him back or move the window (online, maximize, minimize, mode). For anything else addressed to him: intent "command", no actions, and a short reply saying all systems are offline. Talk not for him: "ignore".
 - muted=true: Jarvis is silent. Only honor an explicit unmute, wake, or return request; ignore other speech.
+- role="admin": the signed-in user is the administrator and laptop actions will run immediately. role="user": the action will wait for an administrator PIN.
 Compound requests give several actions, e.g. "go offline and sit in the corner" = offline + minimize(mute=false).
 
 Examples (the user will phrase things differently):
@@ -1566,6 +1641,21 @@ Examples (the user will phrase things differently):
 "Jarvis, terminate" -> {"intent":"command","actions":[{"do":"close"}],"reply":"","speak":null,"deep":false}
 "you can shut down for now" -> {"intent":"command","actions":[{"do":"offline"}],"reply":"Going offline, Sir.","speak":null,"deep":false}
 "let's use the faster brain" -> {"intent":"command","actions":[{"do":"engine","name":"groq"}],"reply":"Switching to Groq.","speak":null,"deep":false}
+"open Chrome and search the weather, read it out" -> {"intent":"command","actions":[{"do":"search","query":"weather today","open":true,"read":true}],"reply":"On it.","speak":null,"deep":false}
+"open my Downloads folder" -> {"intent":"command","actions":[{"do":"open","target":"Downloads"}],"reply":"Opening it.","speak":null,"deep":false}
+"open the file tax return 2025.pdf" -> {"intent":"command","actions":[{"do":"file","target":"tax return 2025.pdf"}],"reply":"Opening the file.","speak":null,"deep":false}
+"send an email to Mom saying I'll be late" -> {"intent":"command","actions":[{"do":"email","action":"send","to":"Mom","subject":"Running late","body":"Hi Mom, I'll be late tonight. I'll let you know when I'm on my way. Love you."}],"reply":"I'll draft it for you.","speak":null,"deep":false}
+"what's on my calendar today" -> {"intent":"command","actions":[{"do":"calendar","action":"list","days":1}],"reply":"Checking your calendar.","speak":null,"deep":false}
+"schedule a meeting with Alex tomorrow at 3pm" -> {"intent":"command","actions":[{"do":"calendar","action":"create","title":"Meeting with Alex","start":"2026-11-07T15:00:00","end":"2026-11-07T16:00:00"}],"reply":"Adding it.","speak":null,"deep":false}
+"run ipconfig" -> {"intent":"command","actions":[{"do":"shell","command":"ipconfig"}],"reply":"Running it.","speak":null,"deep":false}
+"lock my laptop" -> {"intent":"command","actions":[{"do":"system","action":"lock"}],"reply":"Locking it.","speak":null,"deep":false}
+"do I have any new WhatsApp messages" -> {"intent":"command","actions":[{"do":"message","app":"whatsapp","action":"read"}],"reply":"Checking WhatsApp.","speak":null,"deep":false}
+"read my unread email" -> {"intent":"command","actions":[{"do":"message","app":"gmail","action":"read"}],"reply":"Checking your inbox.","speak":null,"deep":false}
+"reply to Srija saying I'll call later" -> {"intent":"command","actions":[{"do":"message","app":"whatsapp","action":"reply","to":"Srija","message":"I'll call later."}],"reply":"I'll draft that reply.","speak":null,"deep":false}
+"what's on my screen" -> {"intent":"command","actions":[{"do":"screen","action":"look","question":"Describe what is on the screen and point out anything important."}],"reply":"Let me look.","speak":null,"deep":false}
+"click the Compose button and type hello" -> {"intent":"command","actions":[{"do":"screen","action":"act","instruction":"Click the Compose button, then type hello in the message body."}],"reply":"I'll prepare that.","speak":null,"deep":false}
+"read the file notes.txt" -> {"intent":"command","actions":[{"do":"file","action":"read","target":"notes.txt"}],"reply":"Reading it.","speak":null,"deep":false}
+"list my Downloads folder" -> {"intent":"command","actions":[{"do":"file","action":"list","target":"Downloads"}],"reply":"Listing it.","speak":null,"deep":false}
 "tell me a joke out loud" -> {"intent":"chat","actions":[],"reply":"","speak":true,"deep":false}
 "explain how TCP congestion control works" -> {"intent":"chat","actions":[],"reply":"","speak":null,"deep":true}
 "no" -> {"intent":"ignore","actions":[],"reply":"","speak":null,"deep":false}"""
@@ -1588,6 +1678,47 @@ CONTROL_REQUEST = re.compile(
     r"(?:speak|talk) (?:to me )?(?:in )?(?:text|voice)|"
     r"(?:answer|respond|reply) (?:in )?(?:text|voice)|"
     r"go quiet|stop talking|be quiet)\b",
+    re.IGNORECASE,
+)
+COMPUTER_REQUEST = re.compile(
+    r"\b(?:open|launch|start|run)\s+(?:the\s+|my\s+|a\s+)?"
+    r"(?:browser|chrome|edge|firefox|notepad|calculator|calc|paint|settings|"
+    r"explorer|file explorer|terminal|powershell|cmd|command prompt|word|excel|"
+    r"powerpoint|outlook|spotify|whatsapp|vscode|visual studio code|task manager|"
+    r"control panel|file|folder|document|downloads|desktop|documents|pictures|"
+    r"email|gmail|mail|inbox|calendar|google calendar|"
+    r"command|script)\b|"
+    r"\bopen\s+(?:the\s+|my\s+|a\s+)?[\w][\w .'()\-]*\."
+    r"(?:pdf|docx?|xlsx?|pptx?|txt|csv|png|jpe?g|gif|mp3|mp4|zip|rar|7z|"
+    r"py|js|html?|json)\b|"
+    r"\b(?:search|google|look\s+up|find\s+out|browse)\b|"
+    r"\b(?:send|draft|compose|write|check|read|show)\s+(?:me\s+)?(?:an?\s+)?"
+    r"(?:email|mail|inbox|gmail)\b|"
+    r"\b(?:send|message|text)\s+(?:a\s+|an?\s+)?(?:whatsapp|whats\s+app)\b|"
+    r"\b(?:draft|compose)\s+(?:a\s+)?(?:whatsapp|whats\s+app)\b|"
+    r"\b(?:calendar|schedule|appointment|meeting|event)\b|"
+    r"\b(?:run|execute)\s+(?:a\s+)?(?:command|powershell|shell|script)\b|"
+    r"\b(?:lock|unlock)\s+(?:the\s+|my\s+)?(?:pc|computer|laptop|screen|workstation)\b|"
+    r"\b(?:take|grab|capture)\s+(?:a\s+)?screenshot\b|"
+    r"\b(?:volume|brightness)\b|"
+    r"\b(?:shut\s*down|restart|reboot|sleep)\s+(?:the\s+|my\s+)?(?:pc|computer|laptop|system)\b|"
+    r"\b(?:switch|focus|activate|close|minimi[sz]e)\s+(?:to\s+)?(?:the\s+)?"
+    r"(?:window|app|application)\b|"
+    r"\b(?:switch|focus|activate|close|minimi[sz]e)\s+(?:to\s+)?(?:the\s+)?"
+    r"[\w][\w .'()\-]*\s+(?:window|app|application)\b|"
+    r"\b(?:list|show)\s+(?:my\s+)?(?:open\s+)?windows\b|"
+    r"\b(?:read|check|open|show|any|new|unread)\b[^\r\n]{0,40}"
+    r"\b(?:messages?|whats\s*app|inbox|chats?|email|gmail|mail)\b|"
+    r"\b(?:reply|respond)\s+(?:to\s+)?[\w][\w .'()\-]{0,40}\s+"
+    r"(?:saying|that|with|on\s+whats\s*app)\b|"
+    r"\b(?:look\s+at|see|read|check|what'?s\s+on|what\s+is\s+on)\s+"
+    r"(?:my\s+|the\s+)?(?:screen|display)\b|"
+    r"\b(?:click|double[- ]?click|right[- ]?click|scroll|type|press|drag)\b"
+    r"[^\r\n]{0,60}\b(?:on\s+(?:my\s+|the\s+)?screen|on[- ]screen|there|button|field)\b|"
+    r"\b(?:read|write|append|open|list|find|search)\s+(?:the\s+|my\s+|a\s+)?"
+    r"(?:file|folder|directory|notes?|document)\b|"
+    r"\b(?:list|show)\s+(?:the\s+|my\s+)?"
+    r"(?:files?|folders?|directories|downloads|documents|desktop|pictures)\b",
     re.IGNORECASE,
 )
 PRIVATE_ON_REQUEST = re.compile(
@@ -1682,12 +1813,14 @@ REPEAT_REQUEST = re.compile(
 def classify(text, source):
     ctx = " | ".join(f"{m['role']}: {m['content'][:90]}" for m in recent[-4:]) or "none"
     st = {"online": online, "minimised": mini, "muted": silent, "memory": memory_on, "engine": forced_engine,
-          "text_mode": text_mode, "output_pref": output_pref}
+          "text_mode": text_mode, "output_pref": output_pref,
+          "now": datetime.now().astimezone().isoformat(timespec="minutes"),
+          "role": active_user["role"] if active_user else None}
     user = f"STATE: {json.dumps(st)}\nRECENT: {ctx}\nINPUT ({source}): {text}"
-    for model in (ROUTER_MODEL, GROQ_MODEL):
+    for model in dict.fromkeys((ROUTER_MODEL, GROQ_MODEL)):
         try:
             kw = dict(model=model, messages=[{"role": "system", "content": ROUTER_SYS}, {"role": "user", "content": user}],
-                      temperature=0, max_tokens=250 if model == ROUTER_MODEL else 800,
+                      temperature=0, max_tokens=1200,
                       response_format={"type": "json_object"})
             if model == GROQ_MODEL: kw["reasoning_effort"] = "low"
             raw = groq_client.chat.completions.create(**kw).choices[0].message.content or ""
@@ -1711,35 +1844,537 @@ def enforce(route, source):
             return {**route, "intent": "command", "actions": [], "reply": random.choice(OFFLINE_LINES)}
     return route
 
-def run_actions(acts):
+def pending_public():
+    if not pending_action:
+        return None
+    public = {
+        "stage": pending_action.get("stage", ""),
+        "label": pending_action.get("label", ""),
+        "source": pending_action.get("source", "text"),
+    }
+    if pending_action.get("draft"):
+        public["draft"] = dict(pending_action["draft"])
+    if pending_action.get("warning"):
+        public["warning"] = pending_action["warning"]
+    if pending_action.get("command"):
+        public["command"] = pending_action["command"]
+    if pending_action.get("screen_plan"):
+        public["screen_plan"] = dict(pending_action["screen_plan"])
+    return public
+
+
+def pending_expired():
+    return bool(
+        pending_action
+        and time.time() - pending_action.get("created", 0) > PENDING_TIMEOUT
+    )
+
+
+def clear_pending():
+    global pending_action, auth_error
+    with auth_lock:
+        pending_action = None
+        auth_error = ""
+    auth_message()
+
+
+def set_pending(stage, actions, source, label, **extra):
+    global pending_action
+    pending_action = {
+        "stage": stage,
+        "actions": [dict(action) for action in actions if isinstance(action, dict)],
+        "source": source,
+        "label": label,
+        "created": time.time(),
+        **extra,
+    }
+
+
+def format_draft(draft):
+    kind = draft.get("kind")
+    if kind == "email":
+        return (
+            "EMAIL DRAFT\n"
+            f"To: {draft.get('to', '')}\n"
+            f"Subject: {draft.get('subject', '')}\n\n"
+            f"{draft.get('body', '')}"
+        )
+    if kind == "whatsapp":
+        target = draft.get("to", "")
+        if draft.get("phone"):
+            target = f"{target} ({draft.get('phone')})"
+        elif draft.get("chat"):
+            target = f"{target} (WhatsApp chat)"
+        return (
+            "WHATSAPP DRAFT\n"
+            f"To: {target}\n\n"
+            f"{draft.get('message', '')}"
+        )
+    return json.dumps(draft, indent=2, ensure_ascii=False)
+
+
+def show_draft(draft):
+    text = format_draft(draft)
+    push_chat(new_id(), "jarvis", text, persist=True)
+    return text
+
+
+def build_draft(action):
+    name = action.get("do")
+    if name == "email":
+        return jarvis_services.build_email_draft(
+            action.get("to", ""),
+            action.get("subject", ""),
+            action.get("body", ""),
+        )
+    if name == "whatsapp":
+        return jarvis_services.build_whatsapp_draft(
+            action.get("to", ""),
+            action.get("message", ""),
+        )
+    if name == "message":
+        app = str(action.get("app", "whatsapp")).lower()
+        if app == "whatsapp":
+            return jarvis_services.build_whatsapp_chat_draft(
+                action.get("to") or action.get("chat", ""),
+                action.get("message", ""),
+            )
+        if app in ("gmail", "email"):
+            return jarvis_services.build_email_draft(
+                action.get("to", ""),
+                action.get("subject", ""),
+                action.get("message") or action.get("body", ""),
+            )
+    raise ActionError("I don't know how to draft that action.")
+
+
+def execute_action(action, source="text", speak=None):
+    name = action.get("do")
+    if name == "open":
+        target = action.get("target") or action.get("name") or action.get("query")
+        if not target:
+            raise ActionError("What should I open?")
+        target_text = str(target).strip().casefold()
+        if target_text in {"email", "gmail", "mail", "inbox", "my email", "my gmail"}:
+            return f"Opened {jarvis_services.open_email()}."
+        if target_text in {"calendar", "google calendar", "my calendar"}:
+            return f"Opened {jarvis_services.open_calendar()}."
+        opened = jarvis_pc.open_any(str(target))
+        return f"Opened {opened}."
+    if name == "search":
+        query = action.get("query") or action.get("target")
+        if not query:
+            raise ActionError("What should I search for?")
+        outcome = jarvis_pc.web_search(
+            str(query), open_browser=action.get("open", True) is not False
+        )
+        full = jarvis_pc.format_search_results(outcome)
+        read_aloud = action.get("read")
+        if read_aloud is None:
+            read_aloud = want_voice(source, speak)
+        else:
+            read_aloud = bool(read_aloud)
+        if speak is True:
+            read_aloud = True
+        if read_aloud:
+            push_chat(new_id(), "jarvis", full, persist=True)
+            return jarvis_pc.summarize_search_results(outcome)
+        return full
+    if name == "file":
+        mode = str(action.get("action", "open")).lower()
+        target = action.get("target") or action.get("path") or ""
+        if mode == "read":
+            if not target:
+                raise ActionError("Which file should I read?")
+            return jarvis_pc.read_file(str(target))
+        if mode in ("write", "append"):
+            if not target:
+                raise ActionError("Which file should I write to?")
+            if "content" not in action and "text" not in action:
+                raise ActionError("What should I write in that file?")
+            content = action.get("content", action.get("text", ""))
+            return jarvis_pc.write_file(
+                str(target), str(content), append=(mode == "append")
+            )
+        if mode == "list":
+            return jarvis_pc.list_directory(str(target))
+        if mode == "find":
+            query = action.get("query") or target
+            if not query:
+                raise ActionError("What file name should I look for?")
+            return jarvis_pc.find_files(str(query))
+        if not target:
+            raise ActionError("Which file should I open?")
+        opened = jarvis_pc.open_path(str(target))
+        return f"Opened {opened}."
+    if name == "app":
+        app_name = action.get("name") or action.get("target")
+        if not app_name:
+            raise ActionError("Which app should I open?")
+        app_text = str(app_name).strip().casefold()
+        if app_text in {"email", "gmail", "mail", "inbox"}:
+            return f"Opened {jarvis_services.open_email()}."
+        if app_text in {"calendar", "google calendar"}:
+            return f"Opened {jarvis_services.open_calendar()}."
+        return f"Opened {jarvis_pc.launch_app(str(app_name))}."
+    if name == "shell":
+        command = action.get("command")
+        if not command:
+            raise ActionError("What command should I run?")
+        result = jarvis_pc.run_powershell(str(command))
+        full = jarvis_pc.format_shell_result(result)
+        if want_voice(source, speak) and len(full) > 500:
+            push_chat(new_id(), "jarvis", full, persist=True)
+            return full[:500].rsplit(" ", 1)[0] + "."
+        return full
+    if name == "system":
+        return jarvis_pc.system_action(
+            str(action.get("action", "")), str(action.get("target", ""))
+        )
+    if name == "email":
+        mode = str(action.get("action", "send")).lower()
+        if mode == "open":
+            return f"Opened {jarvis_services.open_email()}."
+        if mode == "draft":
+            draft = build_draft(action)
+            show_draft(draft)
+            return "I've put the draft in the chat. Nothing has been sent."
+        raise ActionError("I need to draft that email before sending it.")
+    if name == "whatsapp":
+        raise ActionError("I need to draft that WhatsApp message before sending it.")
+    if name == "calendar":
+        mode = str(action.get("action", "list")).lower()
+        if mode == "open":
+            return f"Opened {jarvis_services.open_calendar()}."
+        if mode == "create":
+            return jarvis_services.create_event(
+                action.get("title") or action.get("summary", ""),
+                action.get("start", ""),
+                action.get("end", ""),
+                action.get("description", ""),
+                action.get("location", ""),
+            )
+        return jarvis_services.list_events(int(action.get("days", 7) or 7))
+    if name == "message":
+        app = str(action.get("app", "whatsapp")).lower()
+        mode = str(action.get("action", "read")).lower()
+        target = action.get("to") or action.get("chat") or ""
+        if app == "whatsapp":
+            if mode in ("read", "list", "unread"):
+                full = jarvis_whatsapp.format_unread_chats(
+                    jarvis_whatsapp.list_unread_chats(
+                        int(action.get("limit", 8) or 8)
+                    )
+                )
+                if want_voice(source, speak) and len(full) > 700:
+                    push_chat(new_id(), "jarvis", full, persist=True)
+                    return full[:700].rsplit(" ", 1)[0] + "."
+                return full
+            if mode == "open":
+                return f"Opened the WhatsApp chat with {jarvis_whatsapp.open_chat(target)}."
+            if mode == "conversation":
+                if not target:
+                    raise ActionError("Which WhatsApp chat should I read?")
+                return jarvis_whatsapp.read_conversation(
+                    target, str(action.get("question", ""))
+                )
+            raise ActionError("I need to draft that WhatsApp reply first.")
+        if app in ("gmail", "email"):
+            if mode in ("read", "list", "unread"):
+                return jarvis_services.format_unread_email(
+                    jarvis_services.read_unread_email(
+                        int(action.get("limit", 5) or 5)
+                    )
+                )
+            if mode == "open":
+                return f"Opened {jarvis_services.open_email()}."
+            raise ActionError("I need to draft that email reply first.")
+        raise ActionError(f"I don't know how to read {app} messages.")
+    if name == "screen":
+        mode = str(action.get("action", "look")).lower()
+        if mode in ("act", "action", "do"):
+            raise ActionError("I need to prepare that screen action first.")
+        question = action.get("question") or action.get("target") or (
+            "Describe what is on the screen and point out anything important."
+        )
+        answer = jarvis_screen.look(str(question))
+        if want_voice(source, speak) and len(answer) > 700:
+            push_chat(new_id(), "jarvis", answer, persist=True)
+            return answer[:700].rsplit(" ", 1)[0] + "."
+        return answer
+    raise ActionError(f"I don't know how to {describe_action(action)}.")
+
+
+def run_actions(
+    acts,
+    source="text",
+    authorized=None,
+    confirmed_danger=False,
+    confirmed_screen=False,
+    speak=None,
+):
     global online, silent, output_pref
-    note = None
-    for a in acts:
-        d = a.get("do")
-        if d == "close": close_jarvis()
-        elif d == "minimize": act_minimize(bool(a["mute"]) if "mute" in a else None)
-        elif d == "maximize": act_maximize()
-        elif d == "mute": set_silent(True)
-        elif d == "unmute": set_silent(False)
-        elif d == "offline": online = False
-        elif d == "online":
+    if authorized is None:
+        authorized = bool(active_user and active_user["role"] == "admin")
+    notes = []
+    for index, action in enumerate(acts):
+        if not isinstance(action, dict):
+            continue
+        name = action.get("do")
+        if not name:
+            continue
+
+        if name == "close": close_jarvis()
+        elif name == "minimize": act_minimize(bool(action["mute"]) if "mute" in action else None)
+        elif name == "maximize": act_maximize()
+        elif name == "mute": set_silent(True)
+        elif name == "unmute": set_silent(False)
+        elif name == "offline": online = False
+        elif name == "online":
             online, silent = True, False
             if MIC is not None:
                 try:
                     MIC.set_muted(False)
                 except Exception as e:
                     print(f"[Microphone unmute error: {e}]")
-        elif d == "memory":
-            s = str(a.get("state", "")).lower()
-            if s == "wipe": wipe_memory()
-            else: set_memory(s == "on")
-        elif d == "engine": note = do_engine(a.get("name")) or note
-        elif d == "mode": set_text_mode(str(a.get("mode", "")).lower() == "text")
-        elif d == "output":
-            m = str(a.get("mode", "auto")).lower()
-            output_pref = m if m in ("voice", "text", "auto") else "auto"
+        elif name == "memory":
+            state_value = str(action.get("state", "")).lower()
+            if state_value == "wipe": wipe_memory()
+            else: set_memory(state_value == "on")
+        elif name == "engine":
+            note = do_engine(action.get("name")) or None
+            if note:
+                notes.append(note)
+        elif name == "mode":
+            set_text_mode(str(action.get("mode", "")).lower() == "text")
+        elif name == "output":
+            mode = str(action.get("mode", "auto")).lower()
+            output_pref = mode if mode in ("voice", "text", "auto") else "auto"
+        else:
+            if is_sensitive(action):
+                if not authorized:
+                    set_pending(
+                        "admin_pin",
+                        acts[index:],
+                        source,
+                        describe_action(action),
+                        speak=speak,
+                    )
+                    auth_message()
+                    return (
+                        f"This needs administrator approval: {describe_action(action)}. "
+                        "Enter the administrator PIN in the window, or say cancel."
+                    )
+                if requires_approval(action):
+                    try:
+                        draft = build_draft(action)
+                    except ActionError as error:
+                        return str(error)
+                    show_draft(draft)
+                    set_pending(
+                        "confirm_send",
+                        [action],
+                        source,
+                        describe_action(action),
+                        draft=draft,
+                        authorized=True,
+                        speak=speak,
+                    )
+                    auth_message()
+                    return (
+                        "I've put the draft in the chat. Say send it to go ahead, "
+                        "or say cancel."
+                    )
+                if requires_screen_confirmation(action) and not confirmed_screen:
+                    try:
+                        screen_plan = jarvis_screen.prepare_screen_action(
+                            str(
+                                action.get("instruction")
+                                or action.get("target")
+                                or action.get("question")
+                                or ""
+                            )
+                        )
+                    except ActionError as error:
+                        return str(error)
+                    set_pending(
+                        "confirm_screen",
+                        [action],
+                        source,
+                        describe_action(action),
+                        screen_plan=screen_plan,
+                        authorized=True,
+                        speak=speak,
+                    )
+                    auth_message()
+                    summary = str(
+                        screen_plan.get("summary") or describe_action(action)
+                    ).rstrip(" .")
+                    return (
+                        f"I've prepared the screen action: {summary}. "
+                        "Review the plan in the window and confirm, or say cancel."
+                    )
+                if is_destructive(action) and not confirmed_danger:
+                    command = action.get("command") or action.get("action", "")
+                    set_pending(
+                        "danger_confirm",
+                        acts[index:],
+                        source,
+                        describe_action(action),
+                        warning=(
+                            "This action can change or damage the machine. "
+                            "Only confirm if you are sure."
+                        ),
+                        command=str(command),
+                        authorized=True,
+                        speak=speak,
+                    )
+                    auth_message()
+                    return (
+                        "That looks destructive. Say confirm dangerous to proceed, "
+                        "or say cancel."
+                    )
+            try:
+                result = execute_action(action, source, speak=speak)
+            except ActionError as error:
+                return str(error)
+            except Exception as error:
+                print(f"[Action error: {error}]")
+                return "I couldn't complete that action."
+            if result:
+                if is_sensitive(action):
+                    audit_action(action, result)
+                notes.append(result)
     push_state()
-    return note
+    return " ".join(notes).strip() or None
+
+
+def resume_actions(
+    actions,
+    source="text",
+    authorized=True,
+    confirmed_danger=False,
+    confirmed_screen=False,
+    speak=None,
+):
+    global pending_action
+    pending_action = None
+    note = run_actions(
+        actions,
+        source,
+        authorized=authorized,
+        confirmed_danger=confirmed_danger,
+        confirmed_screen=confirmed_screen,
+        speak=speak,
+    )
+    auth_message()
+    if note:
+        reply_text(note, source, speak)
+
+
+def authorize_pending_action(pin):
+    global pending_action, auth_error
+    request = pending_action
+    if not request or request.get("stage") != "admin_pin":
+        raise AuthenticationError(
+            "There is no action waiting for administrator approval."
+        )
+    if pending_expired():
+        clear_pending()
+        raise AuthenticationError("That authorization request expired. Please ask again.")
+    auth_store.authenticate(DEFAULT_ADMIN_NAME, pin, require_admin=True)
+    actions = list(request.get("actions") or [])
+    source = request.get("source", "text")
+    speak = request.get("speak")
+    with auth_lock:
+        auth_error = ""
+    auth_message()
+    resume_actions(actions, source, authorized=True, speak=speak)
+
+
+def confirm_pending_action():
+    global pending_action, auth_error
+    request = pending_action
+    if not request:
+        raise AuthenticationError("There is no pending action to confirm.")
+    if pending_expired():
+        clear_pending()
+        raise AuthenticationError("That action expired. Please ask again.")
+    stage = request.get("stage")
+    source = request.get("source", "text")
+    speak = request.get("speak")
+    if stage == "danger_confirm":
+        resume_actions(
+            list(request.get("actions") or []),
+            source,
+            authorized=True,
+            confirmed_danger=True,
+            speak=speak,
+        )
+        return
+    if stage == "confirm_screen":
+        action = (request.get("actions") or [{}])[0]
+        plan = request.get("screen_plan") or {}
+        try:
+            message = jarvis_screen.execute_plan(plan)
+        except ActionError as error:
+            with auth_lock:
+                auth_error = str(error)
+            auth_message()
+            return
+        with auth_lock:
+            pending_action = None
+            auth_error = ""
+        auth_message()
+        audit_action(action, message)
+        reply_text(
+            message,
+            source,
+            speak if speak is not None else (True if source == "voice" else None),
+        )
+        return
+    if stage != "confirm_send":
+        raise AuthenticationError("That action isn't ready to confirm.")
+    action = (request.get("actions") or [{}])[0]
+    draft = request.get("draft") or {}
+    try:
+        if draft.get("kind") == "email" or action.get("do") == "email":
+            sent_to = jarvis_services.send_email(draft)
+            message = f"Sent the email to {sent_to}."
+        elif draft.get("kind") == "whatsapp":
+            if draft.get("chat"):
+                message = jarvis_services.open_whatsapp_chat(
+                    draft.get("chat", ""), draft.get("message", "")
+                )
+            else:
+                message = jarvis_services.open_whatsapp(
+                    draft.get("to", ""),
+                    draft.get("message", ""),
+                    draft.get("phone"),
+                )
+        else:
+            raise ActionError("I don't know how to confirm that action.")
+    except ActionError as error:
+        with auth_lock:
+            auth_error = str(error)
+        auth_message()
+        return
+    with auth_lock:
+        pending_action = None
+        auth_error = ""
+    auth_message()
+    audit_action(action, message)
+    reply_text(message, source, speak if speak is not None else (True if source == "voice" else None))
+
+
+def cancel_pending_action():
+    global pending_action, auth_error
+    source = (pending_action or {}).get("source", "text")
+    with auth_lock:
+        pending_action = None
+        auth_error = ""
+    auth_message()
+    reply_text("Cancelled.", source)
 
 def to_np(a):
     if hasattr(a, "detach"): a = a.detach().cpu().numpy()
@@ -2003,6 +2638,54 @@ def handle(text, source):
     if UNMUTE_REQUEST.fullmatch(command_text):
         set_silent(False)
         return None
+    if pending_action and pending_expired():
+        clear_pending()
+    if pending_action:
+        if source == "text":
+            push_chat(new_id(), "you", text)
+            set_state("processing")
+        stage = pending_action.get("stage")
+        if is_cancel_text(command_text):
+            if source == "voice":
+                push_chat(new_id(), "you", text)
+            cancel_pending_action()
+            return None
+        if stage == "admin_pin":
+            return reply_text(
+                "Enter the administrator PIN in the window to authorize this action, "
+                "or say cancel.",
+                source,
+            )
+        if stage == "confirm_send":
+            if is_approval_text(command_text):
+                if source == "voice":
+                    push_chat(new_id(), "you", text)
+                confirm_pending_action()
+                return None
+            return reply_text(
+                "I'm waiting for your approval. Say send it or cancel.", source
+            )
+        if stage == "danger_confirm":
+            if is_danger_confirmation_text(command_text):
+                if source == "voice":
+                    push_chat(new_id(), "you", text)
+                confirm_pending_action()
+                return None
+            return reply_text(
+                "That action is destructive. Say confirm dangerous or cancel.",
+                source,
+            )
+        if stage == "confirm_screen":
+            if is_approval_text(command_text):
+                if source == "voice":
+                    push_chat(new_id(), "you", text)
+                confirm_pending_action()
+                return None
+            return reply_text(
+                "Review the screen plan in the window, then say confirm or cancel.",
+                source,
+            )
+        clear_pending()
     if source == "voice" and silent:
         set_state("standby")
         return None
@@ -2145,7 +2828,7 @@ def handle(text, source):
         )
         if previous_reply:
             return reply_text(previous_reply, source, True)
-    if source == "text" or CONTROL_REQUEST.search(text):
+    if source == "text" or CONTROL_REQUEST.search(text) or COMPUTER_REQUEST.search(text):
         route = classify(text, source)
     else:
         route = {"intent": "chat", "actions": [], "reply": "", "speak": None,
@@ -2157,7 +2840,7 @@ def handle(text, source):
         set_state(ready_state()); return None
     if source == "voice": push_chat(new_id(), "you", text)
     if route["intent"] == "command":
-        note = run_actions(route["actions"])
+        note = run_actions(route["actions"], source, speak=route.get("speak"))
         reply = note or route["reply"]
         if reply: return reply_text(reply, source, route["speak"])
         set_state(ready_state()); return None
@@ -2236,14 +2919,16 @@ def jarvis_brain():
         greeting_pending = False
         pending = None
         while auth_ready.is_set():
-            if auth_management and auth_management.get("mode") == "add_user":
+            with auth_lock:
+                management = dict(auth_management) if auth_management else None
+            if management and management.get("mode") == "add_user":
                 try:
                     prompt = auth_prompt_queue.get_nowait()
                 except queue.Empty:
                     prompt = None
                 if prompt:
                     speak_auth_prompt(prompt)
-                step = auth_management.get("step")
+                step = management.get("step")
                 if step not in ("username", "spelling", "gender"):
                     time.sleep(0.1)
                     continue

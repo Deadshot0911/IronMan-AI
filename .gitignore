@@ -26,6 +26,11 @@ jarvis_users.sqlite3-wal
 jarvis_private_chats.sqlite3
 jarvis_private_chats.sqlite3-shm
 jarvis_private_chats.sqlite3-wal
+jarvis_google_token.json
+jarvis_google_credentials.json
+jarvis_contacts.json
+jarvis_actions.log
+@AutomationLog.txt
 vosk-model/
 vosk-model-small/
 node_modules/
